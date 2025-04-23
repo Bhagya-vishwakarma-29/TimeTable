@@ -66,10 +66,23 @@ This manual provides instructions for downloading, setting up, and using the sys
 
 3. **Install Dependencies**:
 
-- The system requires the following Python libraries: `pandas`, `openpyxl`, and their dependencies. Install them using:
+- The system requires the following Python libraries:
+  - `pandas`: Data manipulation and analysis
+  - `openpyxl`: Reading/writing Excel files
+  - `datetime`: Date and time manipulation
+  - `random`: Random number generation
+  - `collections`: Special container datatypes (e.g., defaultdict)
+  - `csv`: CSV file reading/writing
+  - `json`: JSON data manipulation
+  - `os`: Operating system interfaces
+  - `traceback`: Stack trace extraction for error reporting
+
+- Install the main dependencies using:
   ```
   pip install pandas openpyxl
   ```
+- The other packages (`datetime`, `random`, `collections`, `csv`, `json`, `os`, `traceback`) are part of Python's standard library and don't need separate installation.
+
 - Alternatively, if a `requirements.txt` file is provided, run:
   ```
   pip install -r requirements.txt
