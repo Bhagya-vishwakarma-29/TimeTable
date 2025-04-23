@@ -5,6 +5,10 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 from openpyxl.utils import get_column_letter
 from collections import defaultdict
+import csv
+import json
+import os
+import traceback
 
 # Constants
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
@@ -12,18 +16,25 @@ START_TIME = time(9, 0)
 END_TIME = time(18, 30)
 LECTURE_DURATION = 3  # 1.5 hours = 3 slots (30 mins each)
 LAB_DURATION = 4      # 2 hours = 4 slots (30 mins each)
-TUTORIAL_DURATION = 2  # 30 mins = 1 slot
+TUTORIAL_DURATION = 2  # 1 hour = 2 slots (30 mins each)
+SELF_STUDY_DURATION = 2  # 1 hour = 2 slots (30 mins each)
+BREAK_DURATION = 1    # 30 mins = 1 slot
 
-# Color palette for different courses (pastel colors)
+# Lunch break parameters
+LUNCH_WINDOW_START = time(12, 30)  # Lunch breaks can start from 12:30
+LUNCH_WINDOW_END = time(14, 0)    # Last lunch break must end by 14:00 
+LUNCH_DURATION = 60              # Each semester gets 45 min lunch
+
+# Color palette for different courses (vibrant colors)
 COLOR_PALETTE = [
-    "FFD6E0", "FFEFCF", "D6FFCF", "CFFEFF", "D6CFFF", "FFCFF4", 
-    "E8D0A9", "B7E1CD", "C9DAF8", "FFD6CC", "D9D2E9", "EAD1DC",
-    "A4C2F4", "D5A6BD", "B6D7A8", "FFE599", "A2C4C9", "D5D5D5"
+    "FF5733", "33FF57", "3357FF", "FF33A8", "33FFF7", 
+    "F7FF33", "FF33F7", "33F7FF", "FFB533", "B533FF",
+    "33FFB5", "FF5F33", "335FFF", "B5FF33", "FF33B5"
 ]
 
 # Load room data
 try:
-    rooms_df = pd.read_csv('Rooms.csv')
+    rooms_df = pd.read_csv('rooms.csv')
     # Create separate lists for lecture rooms and lab rooms
     lecture_rooms = rooms_df[rooms_df['type'] == 'LECTURE_ROOM']['roomNumber'].tolist()
     computer_lab_rooms = rooms_df[rooms_df['type'] == 'COMPUTER_LAB']['roomNumber'].tolist()
@@ -31,18 +42,18 @@ try:
     
     # Add error handling for room types
     if not lecture_rooms:
-        print("Warning: No LECTURE_ROOM type rooms found in Rooms.csv")
+        print("Warning: No LECTURE_ROOM type rooms found in rooms.csv")
     if not computer_lab_rooms:
-        print("Warning: No COMPUTER_LAB type rooms found in Rooms.csv")
+        print("Warning: No COMPUTER_LAB type rooms found in rooms.csv")
     if not large_rooms:
-        print("Warning: No SEATER_120 type rooms found in Rooms.csv")
+        print("Warning: No SEATER_120 type rooms found in rooms.csv")
 except FileNotFoundError:
-    print("Error: File 'Rooms.csv' not found in the current directory")
+    print("Error: File 'rooms.csv' not found in the current directory")
     lecture_rooms = []
     computer_lab_rooms = []
     large_rooms = []
 except Exception as e:
-    print(f"Error loading Rooms.csv: {e}")
+    print(f"Error loading rooms.csv: {e}")
     lecture_rooms = []
     computer_lab_rooms = []
     large_rooms = []
@@ -74,11 +85,11 @@ def generate_time_slots():
     
     return slots
 
-# Load data from Excel
+# Load data from CSV
 try:
-    df = pd.read_excel('combined.xlsx', sheet_name='Sheet1')
+    df = pd.read_csv('combined.csv')
 except FileNotFoundError:
-    print("Error: File 'combined.xlsx' not found in the current directory")
+    print("Error: File 'combined.csv' not found in the current directory")
     exit()
 
 def is_break_time(slot):
@@ -190,514 +201,689 @@ def check_professor_constraint(professor_schedule, faculty, day, start_slot, dur
     return True
 
 def generate_all_timetables():
-    TIME_SLOTS = generate_time_slots()
+    """Generate a single timetable for all departments and semesters with basket course support"""
+    global TIME_SLOTS
+    initialize_time_slots()  # Initialize time slots before using
+    
+    # Load configuration and required data
+    rooms = load_rooms()
+    batch_info = load_batch_data()
+    
+    # Create a single workbook for all timetables
     wb = Workbook()
     wb.remove(wb.active)  # Remove default sheet
     
-    professor_schedule = {}   # Track professor assignments
-    classroom_schedule = {}   # Track classroom assignments
+    # Create an overview sheet
+    overview_sheet = wb.create_sheet(title="Overview")
+    overview_sheet.append(["Combined Timetable for All Departments and Semesters"])
+    overview_sheet.append(["Generated on:", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    overview_sheet.append([])
+    overview_sheet.append(["Department", "Semester", "Sheet Name"])
     
-    # Initialize classroom schedules for all rooms
-    for room in lecture_rooms + computer_lab_rooms + large_rooms:
-        classroom_schedule[room] = {day: set() for day in range(len(DAYS))}
+    # Track professor assignments and unscheduled components
+    professor_schedule = {}
+    unscheduled_components = set()
     
-    # Pre-assign a fixed lecture room for each department/semester combination
-    section_lecture_rooms = {}
-    section_lab_rooms = {}
-    available_lecture_rooms = lecture_rooms.copy()
-    available_lab_rooms = computer_lab_rooms.copy()
+    # Color palette for subjects (vibrant colors)
+    subject_colors = [
+        "FF6B6B", "4ECDC4", "FF9F1C", "5D5FEF", "45B7D1", 
+        "F72585", "7209B7", "3A0CA3", "4361EE", "4CC9F0",
+        "06D6A0", "FFD166", "EF476F", "118AB2", "073B4C"
+    ]
+
+    # Add specific colors for basket groups
+    basket_group_colors = {
+        'B1': "FFA07A",  # Light salmon
+        'B2': "98FB98",  # Pale green  
+        'B3': "87CEFA",  # Light sky blue
+        'B4': "FFD700",  # Gold
+        'B5': "DA70D6",  # Orchid
+        'B6': "20B2AA",  # Light sea green
+        'B7': "FF6347",  # Tomato
+        'B8': "8A2BE2",  # Blue violet
+        'B9': "32CD32"   # Lime green
+    }
     
-    # First identify all department/semester combinations
-    dept_sem_combinations = []
-    for department in df['Department'].unique():
-        for semester in df[df['Department'] == department]['Semester'].unique():
-            dept_sem_combinations.append((department, semester))
+    # Add a list to track self-study only courses
+    self_study_courses = []
     
-    # Randomly assign one lecture room to each department/semester
-    for dept, sem in dept_sem_combinations:
-        section_key = (dept, sem)
-        if available_lecture_rooms:
-            # Pop a room from available rooms to ensure no duplicates
-            assigned_room = available_lecture_rooms.pop(0)
-            section_lecture_rooms[section_key] = assigned_room
-            # Re-add at the end to ensure rooms are reused only after all others are used
-            available_lecture_rooms.append(assigned_room)
-        else:
-            # If we run out of lecture rooms, start reusing from the beginning
-            section_lecture_rooms[section_key] = lecture_rooms[0] if lecture_rooms else "No Lecture Room"
-            
-        # Assign two lab rooms for lab sessions to accommodate more students
-        if len(computer_lab_rooms) >= 2:
-            # Take two lab rooms if available
-            assigned_lab1 = computer_lab_rooms[0]
-            assigned_lab2 = computer_lab_rooms[1]
-            # Store as a list of two labs
-            section_lab_rooms[section_key] = [assigned_lab1, assigned_lab2]
-        elif computer_lab_rooms:
-            # If only one lab room is available, use it twice (though this is not ideal)
-            assigned_lab = computer_lab_rooms[0]
-            section_lab_rooms[section_key] = [assigned_lab, assigned_lab]
-        else:
-            # If no lab rooms available
-            section_lab_rooms[section_key] = ["No Lab Room", "No Lab Room"]
+    # Get all unique semester numbers for lunch breaks
+    all_semesters = sorted(set(int(str(sem)[0]) for sem in df['Semester'].unique()))
     
-    # Create a dictionary to store assigned classrooms for each course
-    course_classrooms = {}
-    
-    # Identify courses with multiple sections in the same semester
-    section_counts = df.groupby(['Department', 'Semester', 'Course Code']).size().to_dict()
-    multi_section_courses = {k: v for k, v in section_counts.items() if v > 1}
+    # Calculate lunch breaks dynamically
+    lunch_breaks = calculate_lunch_breaks(all_semesters)
+
+    # Process each department
+    row_index = 5  # Starting row for overview links
     
     for department in df['Department'].unique():
+        # Track assigned faculty for courses
+        course_faculty_assignments = {}
+        
+        # Process all semesters for this department
         for semester in df[df['Department'] == department]['Semester'].unique():
-            courses = df[(df['Department'] == department) & (df['Semester'] == semester)].copy()
+            # Filter out courses marked as not to be scheduled
+            courses = df[(df['Department'] == department) & 
+                        (df['Semester'] == semester) &
+                        ((df['Schedule'].fillna('Yes').str.upper() == 'YES') | 
+                         (df['Schedule'].isna()))].copy()
             
             if courses.empty:
                 continue
-            
-            # Create worksheet for this department-semester
-            ws = wb.create_sheet(title=f"{department}_{semester}")
-            
-            # Initialize timetable structure
-            timetable = {day: {slot: {'type': None, 'code': '', 'name': '', 'faculty': '', 'classroom': ''} 
-                         for slot in range(len(TIME_SLOTS))} for day in range(len(DAYS))}
-            
-            # Dictionary to store course colors and generate course color generator
-            course_colors = {}
-            color_gen = generate_course_color()
-            
-            # Get the pre-assigned lecture room for this section
-            section_key = (department, semester)
-            assigned_lecture_room = section_lecture_rooms.get(section_key, "No Lecture Room")
-            assigned_lab_rooms = section_lab_rooms.get(section_key, ["No Lab Room", "No Lab Room"]) 
-            
-            # Process all courses to ensure LTPS requirements are met
+
+            # First handle lab scheduling as a separate pass
+            lab_courses = courses[courses['P'] > 0].copy()
+            lab_courses['priority'] = lab_courses.apply(get_course_priority, axis=1)
+            lab_courses = lab_courses.sort_values('priority', ascending=False)
+
+            # Handle remaining courses after labs
+            non_lab_courses = courses[courses['P'] == 0].copy()
+            non_lab_courses['priority'] = non_lab_courses.apply(get_course_priority, axis=1)
+            non_lab_courses = non_lab_courses.sort_values('priority', ascending=False)
+
+            # Combine sorted courses with labs first
+            courses = pd.concat([lab_courses, non_lab_courses])
+
+            # Get section info
+            dept_info = batch_info.get((department, semester))
+            num_sections = dept_info['num_sections'] if dept_info else 1
+
+            # First identify self-study only courses
             for _, course in courses.iterrows():
-                code = str(course['Course Code'])
-                name = str(course['Course Name'])
-                faculty = str(course['Faculty'])
+                l = int(course['L']) if pd.notna(course['L']) else 0
+                t = int(course['T']) if pd.notna(course['T']) else 0
+                p = int(course['P']) if pd.notna(course['P']) else 0
+                s = int(course['S']) if pd.notna(course['S']) else 0
                 
-                # Extract LTPS values, ensuring they're integers or 0 if NaN
-                l_hours = int(course['L']) if pd.notna(course['L']) else 0
-                t_hours = int(course['T']) if pd.notna(course['T']) else 0
-                p_hours = int(course['P']) if pd.notna(course['P']) else 0
-                s_hours = int(course['S']) if pd.notna(course['S']) and 'S' in course else 0
+                if s > 0 and l == 0 and t == 0 and p == 0:
+                    self_study_courses.append({
+                        'code': str(course['Course Code']),
+                        'name': str(course['Course Name']),
+                        'faculty': str(course['Faculty']),
+                        'department': department,
+                        'semester': semester
+                    })
+
+            # Process each section
+            for section in range(num_sections):
+                section_title = f"{department}_{semester}" if num_sections == 1 else f"{department}_{semester}_{chr(65+section)}"
+                ws = wb.create_sheet(title=section_title)
                 
-                # Skip if no hours are scheduled for this course
-                if l_hours == 0 and t_hours == 0 and p_hours == 0:
-                    continue
+                # Add to overview sheet
+                overview_sheet.cell(row=row_index, column=1, value=department)
+                overview_sheet.cell(row=row_index, column=2, value=str(semester))
+                overview_sheet.cell(row=row_index, column=3, value=section_title)
+                row_index += 1
                 
-                # Assign a color to this course if not already assigned
-                if code not in course_colors:
-                    # Store LTPS values with the course info
-                    course_colors[code] = {
-                        "color": next(color_gen), 
-                        "name": name, 
-                        "faculty": faculty,
-                        "L": l_hours,
-                        "T": t_hours,
-                        "P": p_hours,
-                        "S": s_hours
-                    }
+                # Initialize timetable structure
+                timetable = {day: {slot: {'type': None, 'code': '', 'name': '', 'faculty': '', 'classroom': ''} 
+                         for slot in range(len(TIME_SLOTS))} for day in range(len(DAYS))}
                 
-                if faculty not in professor_schedule:
-                    professor_schedule[faculty] = {day: set() for day in range(len(DAYS))}
+                # Create a mapping for subject colors
+                subject_color_map = {}
+                course_faculty_map = {}  # For legend
+                color_idx = 0
                 
-                # Calculate number of sessions needed
-                # For lectures: 1.5-hour sessions
-                num_lecture_sessions = l_hours // 1.5
-                if l_hours % 1.5 > 0:
-                    num_lecture_sessions += 1
-                
-                # For tutorials: 1-hour sessions 
-                num_tutorial_sessions = t_hours
-                
-                # For practicals: 2-hour sessions
-                num_lab_sessions = p_hours // 2
-                if p_hours % 2 > 0:
-                    num_lab_sessions += 1
-                
-                # Store which days course components have been scheduled on
-                scheduled_days = set()
-                
-                # Schedule practicals first (if any)
-                if p_hours > 0:
-                    for _ in range(int(num_lab_sessions)):
-                        # Try to schedule on days where no other component of this course exists
-                        scheduled = False
-                        attempts = 0
-                        preferred_days = [d for d in range(len(DAYS)) if d not in scheduled_days]
-                        
-                        # If all days already have components, allow scheduling on any day
-                        if not preferred_days:
-                            preferred_days = list(range(len(DAYS)))
-                        
-                        while not scheduled and attempts < 1000:
-                            # Prioritize preferred days but fallback to any day if needed
-                            if preferred_days and attempts < 500:
-                                day = random.choice(preferred_days)
-                            else:
-                                day = random.randint(0, len(DAYS)-1)
-                            
-                            if len(TIME_SLOTS) >= LAB_DURATION:
-                                start_slot = random.randint(0, len(TIME_SLOTS)-LAB_DURATION)
-                                
-                                # Check if all required slots are free and not in break time
-                                slots_free = True
-                                for i in range(LAB_DURATION):
-                                    if start_slot+i in professor_schedule[faculty][day] or is_break_time(TIME_SLOTS[start_slot+i]):
-                                        slots_free = False
-                                        break
-                                    
-                                    # Check classroom conflicts - handle both single and dual lab cases
-                                    if isinstance(assigned_lab_rooms, list):
-                                        lab1, lab2 = assigned_lab_rooms
-                                        if (start_slot+i in classroom_schedule[lab1][day] or 
-                                            start_slot+i in classroom_schedule[lab2][day] or
-                                            timetable[day][start_slot+i]['type'] is not None):
-                                            slots_free = False
-                                            break
-                                    else:
-                                        if (start_slot+i in classroom_schedule[assigned_lab_rooms][day] or
-                                            timetable[day][start_slot+i]['type'] is not None):
-                                            slots_free = False
-                                            break
-                                
-                                # Add check for professor constraint (REQ-10)
-                                if slots_free:
-                                    slots_free = check_professor_constraint(professor_schedule, faculty, day, start_slot, LAB_DURATION, timetable, TIME_SLOTS)
-                                
-                                if slots_free:
-                                    # Mark professor and classroom(s) as busy
-                                    for i in range(LAB_DURATION):
-                                        professor_schedule[faculty][day].add(start_slot+i)
-                                        
-                                        # Update classroom schedules based on type
-                                        if isinstance(assigned_lab_rooms, list):
-                                            lab1, lab2 = assigned_lab_rooms
-                                            classroom_schedule[lab1][day].add(start_slot+i)
-                                            classroom_schedule[lab2][day].add(start_slot+i)
-                                        else:
-                                            classroom_schedule[assigned_lab_rooms][day].add(start_slot+i)
-                                        
-                                        timetable[day][start_slot+i]['type'] = 'LAB'
-                                        timetable[day][start_slot+i]['code'] = code if i == 0 else ''
-                                        timetable[day][start_slot+i]['name'] = name if i == 0 else ''
-                                        timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
-                                        timetable[day][start_slot+i]['classroom'] = f"{assigned_lab_rooms[0]} & {assigned_lab_rooms[1]}" if i == 0 else ''
-                                    scheduled = True
-                                    scheduled_days.add(day)
-                            attempts += 1
-                
-                # Schedule lectures
-                if l_hours > 0:
-                    for _ in range(int(num_lecture_sessions)):
-                        # Try to schedule on days where no other component of this course exists
-                        scheduled = False
-                        attempts = 0
-                        preferred_days = [d for d in range(len(DAYS)) if d not in scheduled_days]
-                        
-                        # If all days already have components, allow scheduling on any day
-                        if not preferred_days:
-                            preferred_days = list(range(len(DAYS)))
-                        
-                        while not scheduled and attempts < 1000:
-                            # Prioritize preferred days but fallback to any day if needed
-                            if preferred_days and attempts < 500:
-                                day = random.choice(preferred_days)
-                            else:
-                                day = random.randint(0, len(DAYS)-1)
-                                
-                            if len(TIME_SLOTS) >= LECTURE_DURATION:
-                                start_slot = random.randint(0, len(TIME_SLOTS)-LECTURE_DURATION)
-                                
-                                # Check if all required slots are free and not in break time
-                                slots_free = True
-                                for i in range(LECTURE_DURATION):
-                                    if (start_slot+i in professor_schedule[faculty][day] or 
-                                        start_slot+i in classroom_schedule[assigned_lecture_room][day] or
-                                        timetable[day][start_slot+i]['type'] is not None or
-                                        is_break_time(TIME_SLOTS[start_slot+i])):
-                                        slots_free = False
-                                        break
-                                
-                                # Add check for professor constraint (REQ-10)
-                                if slots_free:
-                                    slots_free = check_professor_constraint(professor_schedule, faculty, day, start_slot, LECTURE_DURATION, timetable, TIME_SLOTS)
-                                
-                                if slots_free:
-                                    # Mark professor and classroom as busy
-                                    for i in range(LECTURE_DURATION):
-                                        professor_schedule[faculty][day].add(start_slot+i)
-                                        classroom_schedule[assigned_lecture_room][day].add(start_slot+i)
-                                        timetable[day][start_slot+i]['type'] = 'LEC'
-                                        timetable[day][start_slot+i]['code'] = code if i == 0 else ''
-                                        timetable[day][start_slot+i]['name'] = name if i == 0 else ''
-                                        timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
-                                        timetable[day][start_slot+i]['classroom'] = assigned_lecture_room if i == 0 else ''
-                                    scheduled = True
-                                    scheduled_days.add(day)
-                            attempts += 1
-                
-                # Schedule tutorials
-                if t_hours > 0:
-                    for _ in range(int(num_tutorial_sessions)):
+                # Assign colors to each unique subject
+                for _, course in courses.iterrows():
+                    code = str(course['Course Code'])
+                    if code not in subject_color_map and code and code != 'nan':
+                        if is_basket_course(code):
+                            basket_group = get_basket_group(code)
+                            # Use predefined basket group color
+                            subject_color_map[code] = basket_group_colors.get(basket_group, subject_colors[color_idx % len(subject_colors)])
+                        else:
+                            subject_color_map[code] = subject_colors[color_idx % len(subject_colors)]
+                        course_faculty_map[code] = {
+                            'name': str(course['Course Name']),
+                            'faculty': str(course['Faculty'])
+                        }
+                        color_idx += 1
+
+                # Process all courses - both lab and non-lab
+                for _, course in courses.iterrows():
+                    code = str(course['Course Code'])
+                    name = str(course['Course Name'])
+                    faculty = str(course['Faculty'])
+                    
+                    # Skip basket courses (B1, B2, etc)
+                    if not any(code.startswith(f'B{i}') for i in range(1, 10)):
+                        # For same course in different sections, try to use different faculty
+                        if code in course_faculty_assignments:
+                            # If multiple faculty available, try to pick a different one
+                            if '/' in faculty:
+                                faculty_options = [f.strip() for f in faculty.split('/')] 
+                                # Remove already assigned faculty
+                                available_faculty = [f for f in faculty_options 
+                                                     if f not in course_faculty_assignments[code]]
+                                if available_faculty:
+                                    faculty = available_faculty[0]
+                                else:
+                                    faculty = select_faculty(faculty)
+                        else:
+                            faculty = select_faculty(faculty)
+                            course_faculty_assignments[code] = [faculty]
+                    else:
+                        faculty = select_faculty(faculty)
+                    
+                    # Calculate required slots
+                    lecture_sessions, tutorial_sessions, lab_sessions, self_study_sessions = calculate_required_slots(course)
+                    
+                    if faculty not in professor_schedule:
+                        professor_schedule[faculty] = {day: set() for day in range(len(DAYS))}
+
+                    # Schedule lectures
+                    for _ in range(lecture_sessions):
                         scheduled = False
                         attempts = 0
                         while not scheduled and attempts < 1000:
                             day = random.randint(0, len(DAYS)-1)
-                            if len(TIME_SLOTS) >= TUTORIAL_DURATION:
-                                start_slot = random.randint(0, len(TIME_SLOTS)-TUTORIAL_DURATION)
+                            start_slot = random.randint(0, len(TIME_SLOTS)-LECTURE_DURATION)
+                            
+                            # Add check for faculty-course gap
+                            if not check_faculty_course_gap(professor_schedule, timetable, faculty, code, day, start_slot):
+                                attempts += 1
+                                continue
+                            
+                            # Check faculty daily component limit and lecture constraints
+                            if not check_faculty_daily_components(professor_schedule, faculty, day, 
+                                                               department, semester, section, timetable,
+                                                               code, 'LEC'):
+                                attempts += 1
+                                continue
                                 
-                                # Skip if it's break time
-                                if is_break_time(TIME_SLOTS[start_slot]):
-                                    attempts += 1
-                                    continue
-                                    
-                                # Check if all required slots are free
-                                slots_free = True
-                                for i in range(TUTORIAL_DURATION):
-                                    if (start_slot+i in professor_schedule[faculty][day] or 
-                                        start_slot+i in classroom_schedule[assigned_lecture_room][day] or
-                                        timetable[day][start_slot+i]['type'] is not None):
+                            # Check availability and ensure breaks between lectures
+                            slots_free = True
+                            for i in range(LECTURE_DURATION):
+                                current_slot = start_slot + i
+                                if (current_slot in professor_schedule[faculty][day] or 
+                                    timetable[day][current_slot]['type'] is not None or
+                                    is_break_time(TIME_SLOTS[current_slot], semester)):
+                                    slots_free = False
+                                    break
+                                
+                                # Check for lectures before this slot
+                                if current_slot > 0:
+                                    if is_lecture_scheduled(timetable, day, 
+                                                         max(0, current_slot - BREAK_DURATION), 
+                                                         current_slot):
                                         slots_free = False
                                         break
                                 
-                                # Add check for professor constraint (REQ-10)
-                                if slots_free:
-                                    slots_free = check_professor_constraint(professor_schedule, faculty, day, start_slot, TUTORIAL_DURATION, timetable, TIME_SLOTS)
-                                        
-                                if slots_free:
-                                    # Mark professor and classroom as busy
+                                # Check for lectures after this slot
+                                if current_slot < len(TIME_SLOTS) - 1:
+                                    if is_lecture_scheduled(timetable, day,
+                                                         current_slot + 1,
+                                                         min(len(TIME_SLOTS), 
+                                                             current_slot + BREAK_DURATION + 1)):
+                                        slots_free = False
+                                        break
+                            
+                            if slots_free:
+                                room_id = find_suitable_room('LECTURE_ROOM', department, semester, 
+                                                          day, start_slot, LECTURE_DURATION, 
+                                                          rooms, batch_info, timetable, code)
+                                
+                                if room_id:
+                                    classroom = room_id
+                                    
+                                    # Mark slots as used
+                                    for i in range(LECTURE_DURATION):
+                                        professor_schedule[faculty][day].add(start_slot+i)
+                                        timetable[day][start_slot+i]['type'] = 'LEC'
+                                        timetable[day][start_slot+i]['code'] = code if i == 0 else ''
+                                        timetable[day][start_slot+i]['name'] = name if i == 0 else ''
+                                        timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
+                                        timetable[day][start_slot+i]['classroom'] = classroom if i == 0 else ''
+                                    scheduled = True
+                            attempts += 1
+                        if not scheduled:
+                            unscheduled_components.add(
+                                UnscheduledComponent(department, semester, code, name, 
+                                                   faculty, 'LEC', 1, section)
+                            )
+
+                    # Schedule tutorials
+                    for _ in range(tutorial_sessions):
+                        scheduled = False
+                        attempts = 0
+                        while not scheduled and attempts < 1000:
+                            day = random.randint(0, len(DAYS)-1)
+                            
+                            # Add check for faculty-course gap
+                            if not check_faculty_course_gap(professor_schedule, timetable, faculty, code, day, start_slot):
+                                attempts += 1
+                                continue
+                            
+                            # Check faculty daily component limit for tutorials
+                            if not check_faculty_daily_components(professor_schedule, faculty, day,
+                                                               department, semester, section, timetable,
+                                                               code, 'TUT'):
+                                attempts += 1
+                                continue
+                                
+                            start_slot = random.randint(0, len(TIME_SLOTS)-TUTORIAL_DURATION)
+                            
+                            # Check availability
+                            slots_free = True
+                            for i in range(TUTORIAL_DURATION):
+                                if (start_slot+i in professor_schedule[faculty][day] or 
+                                    timetable[day][start_slot+i]['type'] is not None or
+                                    is_break_time(TIME_SLOTS[start_slot+i], semester)):
+                                    slots_free = False
+                                    break
+                            
+                            if slots_free:
+                                room_id = find_suitable_room('LECTURE_ROOM', department, semester, 
+                                                          day, start_slot, TUTORIAL_DURATION, 
+                                                          rooms, batch_info, timetable, code)
+                                
+                                if room_id:
+                                    classroom = room_id
+                                    
+                                    # Mark slots as used
                                     for i in range(TUTORIAL_DURATION):
                                         professor_schedule[faculty][day].add(start_slot+i)
-                                        classroom_schedule[assigned_lecture_room][day].add(start_slot+i)
                                         timetable[day][start_slot+i]['type'] = 'TUT'
                                         timetable[day][start_slot+i]['code'] = code if i == 0 else ''
                                         timetable[day][start_slot+i]['name'] = name if i == 0 else ''
                                         timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
-                                        timetable[day][start_slot+i]['classroom'] = assigned_lecture_room if i == 0 else ''
+                                        timetable[day][start_slot+i]['classroom'] = classroom if i == 0 else ''
                                     scheduled = True
-                                    scheduled_days.add(day)
                             attempts += 1
-            
-            # Write timetable to worksheet with merged cells and breaks
-            # Create header
-            header = ['Day'] + [f"{slot[0].strftime('%H:%M')}-{slot[1].strftime('%H:%M')}" for slot in TIME_SLOTS]
-            ws.append(header)
-            
-            # Apply header formatting
-            header_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
-            header_font = Font(bold=True)
-            header_alignment = Alignment(horizontal='center', vertical='center')
-            
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = header_alignment
-            
-            # Fill data and merge cells
-            break_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
-            border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                          top=Side(style='thin'), bottom=Side(style='thin'))
-            
-            for day_idx, day in enumerate(DAYS):
-                row_num = day_idx + 2  # +1 for header, +1 because rows start at 1
-                ws.append([day])
-                
-                # Track merged regions
-                merge_ranges = []
-                current_merge = None
-                
-                for slot_idx in range(len(TIME_SLOTS)):
-                    cell_value = ''
-                    cell_fill = None
+                        if not scheduled:
+                            unscheduled_components.add(
+                                UnscheduledComponent(department, semester, code, name,
+                                                   faculty, 'TUT', 1, section)
+                            )
+
+                    # Schedule labs with tracking
+                    if lab_sessions > 0:
+                        room_type = get_required_room_type(course)
+                        for _ in range(lab_sessions):
+                            scheduled = False
+                            attempts = 0
+                            scheduling_reason = ""
+                            
+                            # Try each day in random order
+                            days = list(range(len(DAYS)))
+                            random.shuffle(days)
+                            
+                            for day in days:
+                                # Get all possible slots for this day
+                                possible_slots = get_best_slots(timetable, professor_schedule, 
+                                                              faculty, day, LAB_DURATION, 
+                                                              semester, department)
+                                
+                                for start_slot in possible_slots:
+                                    room_id = find_suitable_room(room_type, department, semester,
+                                                               day, start_slot, LAB_DURATION,
+                                                               rooms, batch_info, timetable, code)
+                                    
+                                    if room_id:
+                                        classroom = room_id if ',' not in str(room_id) else f"{room_id.split(',')[0]}+{room_id.split(',')[1]}"
+                                        
+                                        # Mark slots as used
+                                        for i in range(LAB_DURATION):
+                                            professor_schedule[faculty][day].add(start_slot+i)
+                                            timetable[day][start_slot+i]['type'] = 'LAB'
+                                            timetable[day][start_slot+i]['code'] = code if i == 0 else ''
+                                            timetable[day][start_slot+i]['name'] = name if i == 0 else ''
+                                            timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
+                                            timetable[day][start_slot+i]['classroom'] = classroom if i == 0 else ''
+                                        scheduled = True
+                                        break
+                                
+                                if scheduled:
+                                    break
+                                
+                            if not scheduled:
+                                unscheduled_components.add(
+                                    UnscheduledComponent(department, semester, code, name,
+                                                       faculty, 'LAB', 1, section,
+                                                       "Could not find suitable room and time slot combination")
+                                )
+
+                # Schedule self-study sessions
+                for _, course in courses.iterrows():
+                    code = str(course['Course Code'])
+                    name = str(course['Course Name'])
+                    faculty = str(course['Faculty'])
+                    _, _, _, self_study_sessions = calculate_required_slots(course)
                     
-                    # Check if this is break time
-                    if is_break_time(TIME_SLOTS[slot_idx]):
-                        cell_value = "BREAK"
-                        cell_fill = break_fill
-                    elif timetable[day_idx][slot_idx]['type']:
-                        if timetable[day_idx][slot_idx]['code']:  # First slot of activity
+                    if self_study_sessions > 0:
+                        if faculty not in professor_schedule:
+                            professor_schedule[faculty] = {day: set() for day in range(len(DAYS))}
+                        
+                        # Schedule each self-study session (1 hour each)
+                        for _ in range(self_study_sessions):
+                            scheduled = False
+                            attempts = 0
+                            while not scheduled and attempts < 1000:
+                                day = random.randint(0, len(DAYS)-1)
+                                start_slot = random.randint(0, len(TIME_SLOTS)-SELF_STUDY_DURATION)
+                                
+                                # Check availability
+                                slots_free = True
+                                for i in range(SELF_STUDY_DURATION):
+                                    if (start_slot+i in professor_schedule[faculty][day] or 
+                                        timetable[day][start_slot+i]['type'] is not None or
+                                        is_break_time(TIME_SLOTS[start_slot+i], semester)):
+                                        slots_free = False
+                                        break
+                                
+                                if slots_free:
+                                    room_id = find_suitable_room('LECTURE_ROOM', department, semester, 
+                                                              day, start_slot, SELF_STUDY_DURATION, 
+                                                              rooms, batch_info, timetable, code)
+                                    
+                                    if room_id:
+                                        classroom = room_id
+                                        
+                                        # Mark slots as used
+                                        for i in range(SELF_STUDY_DURATION):
+                                            professor_schedule[faculty][day].add(start_slot+i)
+                                            timetable[day][start_slot+i]['type'] = 'SS'  # SS for Self Study
+                                            timetable[day][start_slot+i]['code'] = code if i == 0 else ''
+                                            timetable[day][start_slot+i]['name'] = name if i == 0 else ''
+                                            timetable[day][start_slot+i]['faculty'] = faculty if i == 0 else ''
+                                            timetable[day][start_slot+i]['classroom'] = classroom if i == 0 else ''
+                                        scheduled = True
+                                attempts += 1
+
+                # Write timetable to worksheet
+                header = ['Day'] + [f"{slot[0].strftime('%H:%M')}-{slot[1].strftime('%H:%M')}" for slot in TIME_SLOTS]
+                ws.append(header)
+                
+                header_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+                header_font = Font(bold=True)
+                header_alignment = Alignment(horizontal='center', vertical='center')
+                
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = header_alignment
+                
+                lec_fill = PatternFill(start_color="FA8072", end_color="FA8072", fill_type="solid")  # Salmon
+                lab_fill = PatternFill(start_color="7CFC00", end_color="7CFC00", fill_type="solid")  # Lawn green
+                tut_fill = PatternFill(start_color="87CEEB", end_color="87CEEB", fill_type="solid")  # Sky blue
+                ss_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")   # Gold
+                break_fill = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid") # Silver
+                border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                              top=Side(style='thin'), bottom=Side(style='thin'))
+                
+                for day_idx, day in enumerate(DAYS):
+                    row_num = day_idx + 2
+                    ws.append([day])
+                    
+                    merge_ranges = []  # Track merge ranges for this row
+                    
+                    for slot_idx in range(len(TIME_SLOTS)):
+                        cell_value = ''
+                        cell_fill = None
+                        
+                        if is_break_time(TIME_SLOTS[slot_idx], semester):
+                            cell_value = "BREAK"
+                            cell_fill = break_fill
+                        elif timetable[day_idx][slot_idx]['type']:
                             activity_type = timetable[day_idx][slot_idx]['type']
                             code = timetable[day_idx][slot_idx]['code']
                             classroom = timetable[day_idx][slot_idx]['classroom']
+                            faculty = timetable[day_idx][slot_idx]['faculty']
                             
-                            # Use course-specific color
-                            if code in course_colors:
-                                cell_fill = PatternFill(start_color=course_colors[code]["color"], 
-                                                        end_color=course_colors[code]["color"], 
-                                                        fill_type="solid")
-                            
-                            if activity_type == 'LEC':
-                                duration = LECTURE_DURATION
-                            elif activity_type == 'LAB':
-                                duration = LAB_DURATION
-                            else:  # TUT
-                                duration = TUTORIAL_DURATION
-                            
-                            # Create merged range
-                            start_col = get_column_letter(slot_idx + 2)  # +1 for day column
-                            end_col = get_column_letter(slot_idx + duration + 1)
-                            merge_range = f"{start_col}{row_num}:{end_col}{row_num}"
-                            merge_ranges.append(merge_range)
-                            
-                            # Display course code, activity type, and classroom in the timetable
-                            cell_value = f"{code} {activity_type}\n room no. :{classroom}"
+                            # Only create content for start of activity
+                            if code:
+                                # Get duration based on activity type
+                                duration = {
+                                    'LEC': LECTURE_DURATION,
+                                    'LAB': LAB_DURATION,
+                                    'TUT': TUTORIAL_DURATION,
+                                    'SS': SELF_STUDY_DURATION
+                                }.get(activity_type, 1)
+                                
+                                # Use subject-specific color
+                                if code in subject_color_map:
+                                    cell_fill = PatternFill(start_color=subject_color_map[code],
+                                                          end_color=subject_color_map[code],
+                                                          fill_type="solid")
+                                else:
+                                    cell_fill = {
+                                        'LAB': lab_fill,
+                                        'TUT': tut_fill,
+                                        'SS': ss_fill,
+                                        'LEC': lec_fill
+                                    }.get(activity_type, lec_fill)
+                                
+                                if code and is_basket_course(code):
+                                    basket_group = get_basket_group(code)
+                                    # Get all courses from same basket in this slot
+                                    basket_codes = set()  # Use set to avoid duplicates
+                                    basket_details = {}
+                                    
+                                    # First collect all courses in this basket group
+                                    for slot_id, slot_data in timetable[day_idx].items():
+                                        slot_code = slot_data.get('code', '')
+                                        if (slot_data.get('type') == activity_type and 
+                                            get_basket_group(slot_code) == basket_group):
+                                            basket_codes.add(slot_code)  # Add to set instead of list
+                                            # Only store details if not already present
+                                            if slot_code not in basket_details:
+                                                basket_details[slot_code] = {
+                                                    'faculty': slot_data['faculty'],
+                                                    'room': slot_data['classroom']
+                                                }
+                                    
+                                    if basket_codes:
+                                        # Group header
+                                        basket_header = f"{basket_group} Courses\n"
+                                        # List of all unique course codes
+                                        codes_str = ', '.join(sorted(basket_codes))
+                                        # Course details with rooms (unique entries)
+                                        course_details = [
+                                            f"{code}: {details['faculty']} ({details['room']})"
+                                            for code, details in sorted(basket_details.items())
+                                            if code and details['faculty'] and details['room']
+                                        ]
+                                        
+                                        cell_value = f"{basket_header}{codes_str}\n" + "\n".join(course_details)
+                                else:
+                                    cell_value = f"{code} {activity_type}\nroom no. :{classroom}\n{faculty}"
+                                
+                                # Create merge range
+                                if duration > 1:
+                                    start_col = get_column_letter(slot_idx + 2)
+                                    end_col = get_column_letter(slot_idx + duration + 1)
+                                    merge_range = f"{start_col}{row_num}:{end_col}{row_num}"
+                                    merge_ranges.append((merge_range, cell_fill))
+                        
+                        cell = ws.cell(row=row_num, column=slot_idx+2, value=cell_value)
+                        if cell_fill:
+                            cell.fill = cell_fill
+                        cell.border = border
+                        cell.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center', indent=1)
+                    
+                    # Apply merges after creating all cells in the row
+                    for merge_range, fill in merge_ranges:
+                        ws.merge_cells(merge_range)
+                        # Ensure merged cell has consistent formatting
+                        merged_cell = ws[merge_range.split(':')[0]]
+                        merged_cell.fill = fill
+                        merged_cell.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center', indent=2)
+
+                for col_idx in range(1, len(TIME_SLOTS)+2):
+                    col_letter = get_column_letter(col_idx)
+                    ws.column_dimensions[col_letter].width = 15
                 
-                    # Write to cell
-                    cell = ws.cell(row=row_num, column=slot_idx+2, value=cell_value)
-                    if cell_fill:
-                        cell.fill = cell_fill
+                for row in ws.iter_rows(min_row=2, max_row=len(DAYS)+1):
+                    ws.row_dimensions[row[0].row].height = 40
+
+                # Add Self-Study Only Courses section
+                current_row = len(DAYS) + 4  # Initialize current_row here, before any sections
+
+                if self_study_courses:
+                    ss_courses_for_this_section = [c for c in self_study_courses 
+                                               if c['department'] == department and 
+                                               c['semester'] == semester]
+                    
+                    if ss_courses_for_this_section:
+                        ws.cell(row=current_row, column=1, value="Self-Study Only Courses")
+                        ws.cell(row=current_row, column=1).font = Font(bold=True)
+                        current_row += 1
+                        
+                        headers = ['Course Code', 'Course Name', 'Faculty']
+                        for col, header in enumerate(headers, 1):
+                            ws.cell(row=current_row, column=col, value=header)
+                            ws.cell(row=current_row, column=col).font = Font(bold=True)
+                        current_row += 1
+                        
+                        for course in ss_courses_for_this_section:
+                            ws.cell(row=current_row, column=1, value=course['code'])
+                            ws.cell(row=current_row, column=2, value=course['name'])
+                            ws.cell(row=current_row, column=3, value=course['faculty'])
+                            current_row += 1
+                        
+                        current_row += 2  # Add extra spacing after self-study courses
+
+                # Handle unscheduled components section
+                dept_unscheduled = [c for c in unscheduled_components 
+                                    if c.department == department and 
+                                    c.semester == semester and
+                                    (c.section == section if num_sections > 1 else True)]
+
+                if dept_unscheduled:
+                    current_row += 2  # Add spacing after previous section
+                    unsch_title = ws.cell(row=current_row, column=1, value="Unscheduled Components")
+                    unsch_title.font = Font(bold=True, size=12, color="FF0000")
+                    current_row += 2
+
+                    headers = ['Course Code', 'Course Name', 'Faculty', 'Component', 'Sessions', 'Reason']
+                    for col, header in enumerate(headers, 1):
+                        cell = ws.cell(row=current_row, column=col, value=header)
+                        cell.font = Font(bold=True)
+                        cell.border = border
+                        cell.fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        # Set column widths for better readability
+                        ws.column_dimensions[get_column_letter(col)].width = 20
+                    current_row += 1
+
+                    for comp in dept_unscheduled:
+                        cells = [
+                            (comp.code, None),
+                            (comp.name, None),
+                            (comp.faculty, None),
+                            (comp.component_type, None),
+                            (comp.sessions, None),
+                            (comp.reason or "Could not find suitable slot", None)
+                        ]
+                        
+                        for col, (value, fill) in enumerate(cells, 1):
+                            cell = ws.cell(row=current_row, column=col, value=value)
+                            cell.border = border
+                            cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+                        current_row += 1
+                    
+                    current_row += 2  # Add spacing before legend
+
+                # Improved legend formatting
+                legend_title = ws.cell(row=current_row, column=1, value="Legend")
+                legend_title.font = Font(bold=True, size=12)
+                current_row += 2
+
+                # Wider columns for legend
+                ws.column_dimensions['A'].width = 20  # Subject Code
+                ws.column_dimensions['B'].width = 10  # Color (moved next to code)
+                ws.column_dimensions['C'].width = 40  # Subject Name
+                ws.column_dimensions['D'].width = 30  # Faculty
+                ws.column_dimensions['E'].width = 15  # LTPS
+
+                # Add legend headers with better formatting
+                legend_headers = ['Subject Code', 'Color', 'Subject Name', 'Faculty', 'LTPS']
+                for col, header in enumerate(legend_headers, 1):
+                    cell = ws.cell(row=current_row, column=col, value=header)
+                    cell.font = Font(bold=True)
                     cell.border = border
-                    cell.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
-                
-                # Apply all merges for this row
-                for merge_range in merge_ranges:
-                    ws.merge_cells(merge_range)
-            
-            # Add a cell with information about assigned rooms for this section
-            info_row = len(DAYS) + 3
-            info_cell = ws.cell(row=info_row, column=1, value=f"Default Lecture Room: {assigned_lecture_room}")
-            info_cell.font = Font(bold=True)
-            
-            # Display both assigned lab rooms
-            lab_info = f"Default Lab Rooms: {assigned_lab_rooms[0]} & {assigned_lab_rooms[1]}"
-            lab_info_cell = ws.cell(row=info_row+1, column=1, value=lab_info)
-            lab_info_cell.font = Font(bold=True)
-            
-            # Adjust column widths and row heights for better visibility
-            for col_idx in range(1, len(TIME_SLOTS)+2):
-                col_letter = get_column_letter(col_idx)
-                ws.column_dimensions[col_letter].width = 20  # Increase width from 15 to 20
-            
-            # Increase day column width for better visibility
-            ws.column_dimensions['A'].width = 12
-            
-            # Increase row heights for proper text display
-            for row in ws.iter_rows(min_row=2, max_row=len(DAYS)+1):
-                ws.row_dimensions[row[0].row].height = 60  # Increase height from 40 to 60
-            
-            # Add extra padding between timetable and legend
-            legend_start_row = len(DAYS) + 8  # Increased spacing before legend
-            
-            # Create a section header for the legend with better visibility
-            legend_header = ws.cell(row=legend_start_row, column=1, value="LEGEND")
-            legend_header.font = Font(bold=True, size=16)  # Increased font size
-            legend_header.alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[legend_start_row].height = 35  # Taller row for header
-            
-            # Add background shading for the legend header row with wider span
-            for col_idx in range(1, 6):  # Extended to 5 columns
-                cell = ws.cell(row=legend_start_row, column=col_idx)
-                cell.fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")  # Lighter blue
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                   top=Side(style='thin'), bottom=Side(style='thin'))
-            
-            # Format break section with better spacing
-            break_row = legend_start_row + 3  # Added more spacing after header
-            ws.cell(row=break_row, column=1, value="BREAK TIME:").font = Font(bold=True, size=12)
-            
-            break_cell = ws.cell(row=break_row, column=2, value="")
-            break_cell.fill = break_fill
-            break_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                     top=Side(style='thin'), bottom=Side(style='thin'))
-            
-            # Add break time descriptions with updated times
-            break_info = ws.cell(row=break_row, column=3, value="Morning: 10:30-10:45 (15 min), Lunch: 13:00-13:45 (45 min), Inter-class: 5 min")
-            break_info.alignment = Alignment(horizontal='left', vertical='center')
-            break_info.font = Font(size=11)
-            ws.row_dimensions[break_row].height = 28
-            
-            # Add course legend with colors and better formatting
-            legend_row = break_row + 4  # Extra spacing after break section
-            
-            # Add a section header for courses
-            course_header = ws.cell(row=legend_row-1, column=1, value="COURSES:")
-            course_header.font = Font(bold=True, size=12)
-            ws.row_dimensions[legend_row-1].height = 28
-            
-            # Format header row of legend with better visibility
-            headers = ["Course Code", "Color", "Course Name", "Faculty", "L-T-P-S"]
-            for idx, header in enumerate(headers):
-                header_cell = ws.cell(row=legend_row, column=idx+1, value=header)
-                header_cell.font = Font(bold=True)
-                header_cell.fill = PatternFill(start_color="D8E4BC", end_color="D8E4BC", fill_type="solid")  # Softer green
-                header_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                         top=Side(style='thin'), bottom=Side(style='thin'))
-                header_cell.alignment = Alignment(horizontal='center', vertical='center')
-            
-            # Set appropriate widths for all legend columns
-            ws.column_dimensions[get_column_letter(1)].width = 18  # Course code column - increased width
-            ws.column_dimensions[get_column_letter(2)].width = 15  # Color column - increased width
-            ws.column_dimensions[get_column_letter(3)].width = 45  # Name column - wider for long course names
-            ws.column_dimensions[get_column_letter(4)].width = 35  # Faculty column - wider for longer names
-            ws.column_dimensions[get_column_letter(5)].width = 15  # LTPS column
-            
-            # Add course details with proper formatting and padding
-            for i, (code, details) in enumerate(course_colors.items()):
-                row = legend_row + i + 1
-                ws.row_dimensions[row].height = 60  # Increased height for better readability
-                
-                # Course code cell
-                code_cell = ws.cell(row=row, column=1, value=code)
-                code_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                       top=Side(style='thin'), bottom=Side(style='thin'))
-                code_cell.alignment = Alignment(horizontal='center', vertical='center')
-                code_cell.font = Font(size=11)  # Added standard font size
-                
-                # Color cell
-                color_cell = ws.cell(row=row, column=2, value="")
-                color_cell.fill = PatternFill(start_color=details["color"], 
-                                            end_color=details["color"], 
-                                            fill_type="solid")
-                color_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-                
-                # Course name cell with extra padding
-                name_cell = ws.cell(row=row, column=3, value=details["name"])
-                name_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                       top=Side(style='thin'), bottom=Side(style='thin'))
-                name_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True, indent=2)  # Increased indent
-                name_cell.font = Font(size=11)  # Added standard font size
-                
-                # Faculty cell with extra padding
-                faculty_cell = ws.cell(row=row, column=4, value=details["faculty"])
-                faculty_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                          top=Side(style='thin'), bottom=Side(style='thin'))
-                faculty_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True, indent=2)  # Increased indent
-                faculty_cell.font = Font(size=11)  # Added standard font size
-                
-                # Add LTPS cell
-                ltps_text = f"{details.get('L', 0)}-{details.get('T', 0)}-{details.get('P', 0)}-{details.get('S', 0)}"
-                ltps_cell = ws.cell(row=row, column=5, value=ltps_text)
-                ltps_cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                       top=Side(style='thin'), bottom=Side(style='thin'))
-                ltps_cell.alignment = Alignment(horizontal='center', vertical='center')
-                ltps_cell.font = Font(size=11)
-                
-                # Add alternating row colors for better readability
-                if i % 2 == 1:
-                    for col_idx in range(1, 6):  # Updated to include LTPS column
-                        if col_idx != 2:  # Skip the color cell
-                            cell = ws.cell(row=row, column=col_idx)
-                            cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")  # Lighter gray
-            
-            # Add some padding at the bottom of the legend
-            ws.row_dimensions[legend_row + len(course_colors) + 1].height = 20
+                    cell.fill = PatternFill(start_color="F0F0F0", end_color="F0F0F0", fill_type="solid")
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                    # Add padding to header cells
+                    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                current_row += 1
+
+                # Add subject entries with improved spacing and color next to code
+                for code, color in subject_color_map.items():
+                    if code in course_faculty_map:
+                        # Add more spacing between rows
+                        ws.row_dimensions[current_row].height = 30
+                        
+                        # Get LTPS values for this course
+                        ltps_value = ""
+                        for _, course_row in courses.iterrows():
+                            if str(course_row['Course Code']) == code:
+                                l = str(int(course_row['L'])) if pd.notna(course_row['L']) else "0"
+                                t = str(int(course_row['T'])) if pd.notna(course_row['T']) else "0"
+                                p = str(int(course_row['P'])) if pd.notna(course_row['P']) else "0"
+                                s = str(int(course_row['S'])) if pd.notna(course_row['S']) and 'S' in course_row else "0"
+                                ltps_value = f"{l}-{t}-{p}-{s}"
+                                break
+                        
+                        # Create cells with padding and color next to code
+                        cells = [
+                            (code, None),
+                            ('', PatternFill(start_color=color, end_color=color, fill_type="solid")),
+                            (course_faculty_map[code]['name'], None),
+                            (course_faculty_map[code]['faculty'], None),
+                            (ltps_value, None)
+                        ]
+                        
+                        for col, (value, fill) in enumerate(cells, 1):
+                            cell = ws.cell(row=current_row, column=col, value=value)
+                            cell.border = border
+                            if fill:
+                                cell.fill = fill
+                            # Add padding with increased wrap_text and adjusted alignment
+                            cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True, indent=2)
+                        
+                        current_row += 1
+
+    # Format the overview sheet
+    for col in range(1, 4):
+        overview_sheet.column_dimensions[get_column_letter(col)].width = 20
     
+    for row in overview_sheet.iter_rows(min_row=1, max_row=4):
+        for cell in row:
+            cell.font = Font(bold=True)
+    
+    # Apply formatting to the overview table headers
+    for cell in overview_sheet[4]:
+        cell.fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+        cell.font = Font(bold=True)
+        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                           top=Side(style='thin'), bottom=Side(style='thin'))
+    
+    # Apply borders to the overview data
+    for row in overview_sheet.iter_rows(min_row=5, max_row=row_index-1):
+        for cell in row:
+            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                               top=Side(style='thin'), bottom=Side(style='thin'))
+
     # Save the workbook
-    wb.save("timetables.xlsx")
-    print("Final timetables with breaks and course legend saved to timetables.xlsx")
+    wb.save("timetable_all_departments.xlsx")
+    print("Combined timetable for all departments and semesters saved as timetable_all_departments.xlsx")
+    
+    return ["timetable_all_departments.xlsx"]
 
 def check_unscheduled_courses():
     """Check and print courses that are not scheduled according to their L-T-P-S requirements"""
     try:
-        # Load the original course requirements
-        df = pd.read_excel('combined.xlsx', sheet_name='Sheet1')
+        df = pd.read_csv('combined.csv')
         
+        # Check if timetable file exists first
+        if not os.path.exists('timetable_all_departments.xlsx'):
+            print("Warning: timetable_all_departments.xlsx not found. Run generate_all_timetables() first.")
+            return
+
         # Load the generated timetable
-        wb = pd.ExcelFile('timetables.xlsx')
+        wb = pd.ExcelFile('timetable_all_departments.xlsx')
         
         # Dictionary to track scheduled hours for each course
         scheduled_hours = defaultdict(lambda: {'L': 0, 'T': 0, 'P': 0, 'S': 0})
@@ -974,7 +1160,7 @@ def generate_faculty_timetables():
     """Generate individual timetables for each faculty member"""
     try:
         # Load the generated timetable
-        wb = pd.ExcelFile('timetables.xlsx')
+        wb = pd.ExcelFile('timetable_all_departments.xlsx')
         
         # Dictionary to track faculty schedules
         faculty_schedules = {}
@@ -1007,15 +1193,16 @@ def generate_faculty_timetables():
                     # Extract course code, class type, and faculty
                     # Format example: "CS101 LEC room no. :A101"
                     if isinstance(cell_value, str) and 'room no.' in cell_value:
+                        # Split the cell value to extract components
                         parts = cell_value.split()
                         if len(parts) >= 2:
-                            # Find faculty information from combined.xlsx
+                            # Find faculty information from combined.csv
                             course_code = parts[0]
                             class_type = parts[1]
                             
                             try:
                                 # Get the original course data to extract faculty info
-                                course_data = pd.read_excel('combined.xlsx', sheet_name='Sheet1')
+                                course_data = pd.read_csv('combined.csv')
                                 course_row = course_data[course_data['Course Code'] == course_code]
                                 
                                 if not course_row.empty:
@@ -1174,8 +1361,664 @@ def generate_faculty_timetables():
     except Exception as e:
         print(f"Error generating faculty timetables: {e}")
         # Print more detailed error information for debugging
-        import traceback
         traceback.print_exc()
+
+# Initialize global variables
+TIME_SLOTS = []
+lunch_breaks = {}  # Global lunch breaks dictionary
+
+def load_config():
+    """Load duration constants from config file"""
+    try:
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+            return config['duration_constants']
+    except:
+        # Return defaults if config file not found
+        return {
+            'hour_slots': 2,
+            'lecture_duration': 3,
+            'lab_duration': 4,
+            'tutorial_duration': 2,
+            'self_study_duration': 2, 
+            'break_duration': 1
+        }
+
+def initialize_time_slots():
+    """Initialize time slots for scheduling"""
+    global TIME_SLOTS
+    TIME_SLOTS = generate_time_slots()
+
+def calculate_lunch_breaks(semesters):
+    """Dynamically calculate staggered lunch breaks for semesters"""
+    global lunch_breaks
+    lunch_breaks = {}  # Reset global lunch_breaks
+    total_semesters = len(semesters)
+    
+    if total_semesters == 0:
+        return lunch_breaks
+        
+    # Calculate time between breaks to distribute them evenly
+    total_window_minutes = (
+        LUNCH_WINDOW_END.hour * 60 + LUNCH_WINDOW_END.minute -
+        LUNCH_WINDOW_START.hour * 60 - LUNCH_WINDOW_START.minute
+    )
+    stagger_interval = (total_window_minutes - LUNCH_DURATION) / (total_semesters - 1) if total_semesters > 1 else 0
+    
+    # Sort semesters to ensure consistent assignment
+    sorted_semesters = sorted(semesters)
+    
+    for i, semester in enumerate(sorted_semesters):
+        start_minutes = (LUNCH_WINDOW_START.hour * 60 + LUNCH_WINDOW_START.minute + 
+                        int(i * stagger_interval))
+        start_hour = start_minutes // 60
+        start_min = start_minutes % 60
+        
+        end_minutes = start_minutes + LUNCH_DURATION
+        end_hour = end_minutes // 60
+        end_min = end_minutes % 60
+        
+        lunch_breaks[semester] = (
+            time(start_hour, start_min),
+            time(end_hour, end_min)
+        )
+    
+    return lunch_breaks
+
+def is_break_time(slot, semester=None):
+    """Check if a time slot falls within break times"""
+    global lunch_breaks
+    start, end = slot
+    
+    # Morning break: 10:30-11:00
+    morning_break = (time(10, 30) <= start < time(11, 0))
+    
+    # Staggered lunch breaks based on semester
+    lunch_break = False
+    if semester:
+        base_sem = int(str(semester)[0])  # Get base semester number (e.g., 4 from 4A)
+        if base_sem in lunch_breaks:
+            lunch_start, lunch_end = lunch_breaks[base_sem]
+            lunch_break = (lunch_start <= start < lunch_end)
+    else:
+        # For general checks without semester info, block all lunch periods
+        lunch_break = any(lunch_start <= start < lunch_end 
+                         for lunch_start, lunch_end in lunch_breaks.values())
+    
+    return morning_break or lunch_break
+
+def load_rooms():
+    """Load room information from CSV file"""
+    rooms = {}
+    try:
+        with open('rooms.csv', 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rooms[row['id']] = {
+                    'capacity': int(row['capacity']),
+                    'type': row['type'],
+                    'roomNumber': row['roomNumber'],
+                    'schedule': {day: set() for day in range(len(DAYS))}
+                }
+    except FileNotFoundError:
+        print("Warning: rooms.csv not found, using default room allocation")
+        return None
+    return rooms
+
+def load_batch_data():
+    """Load batch information and calculate sections automatically using total_students from combined.csv"""
+    batch_info = {}
+    
+    # Load batch sizes directly from combined.csv
+    try:
+        df = pd.read_csv('combined.csv')
+        
+        # Group by Department and Semester to get total students
+        grouped = df.groupby(['Department', 'Semester'])
+        
+        for (dept, sem), group in grouped:
+            # Check if total_students column exists and has values
+            if 'total_students' in group.columns:
+                # Get the max number of students for this department/semester
+                # Filter out non-numeric values and convert to integers
+                valid_students = []
+                for val in group['total_students']:
+                    try:
+                        if pd.notna(val) and str(val).isdigit():
+                            valid_students.append(int(val))
+                    except (ValueError, TypeError):
+                        continue
+                
+                if valid_students:
+                    total_students = max(valid_students)
+                    
+                    # Default max batch size of 70
+                    max_batch_size = 70
+                    
+                    # Calculate number of sections needed
+                    num_sections = (total_students + max_batch_size - 1) // max_batch_size
+                    section_size = (total_students + num_sections - 1) // num_sections
+
+                    batch_info[(dept, sem)] = {
+                        'total': total_students,
+                        'num_sections': num_sections,
+                        'section_size': section_size
+                    }
+                
+        # Process basket/elective courses individually
+        basket_courses = df[df['Course Code'].astype(str).str.contains('^B[0-9]')]
+        
+        # Process each basket course
+        for _, course in basket_courses.iterrows():
+            code = str(course['Course Code'])
+            # Use total_students column if available and is a valid number
+            if 'total_students' in df.columns:
+                try:
+                    val = course['total_students']
+                    if pd.notna(val) and str(val).isdigit():
+                        total_students = int(val)
+                    else:
+                        # Default to 35 students for basket courses if not a valid number
+                        total_students = 35
+                except (ValueError, TypeError):
+                    total_students = 35
+            else:
+                # Default to 35 students for basket courses if column not available
+                total_students = 35
+                
+            batch_info[('ELECTIVE', code)] = {
+                'total': total_students,
+                'num_sections': 1,  # Electives are typically single section
+                'section_size': total_students
+            }
+            
+    except FileNotFoundError:
+        print("Warning: combined.csv not found, using default batch sizes")
+    except Exception as e:
+        print(f"Warning: Error processing batch data from combined.csv: {e}")
+        
+    return batch_info
+
+def is_basket_course(code):
+    """Check if course is part of a basket based on code prefix"""
+    return code.startswith('B') and '-' in code
+
+def get_basket_group(code):
+    """Get the basket group (B1, B2 etc) from course code"""
+    if is_basket_course(code):
+        return code.split('-')[0]
+    return None
+
+def get_basket_group_slots(timetable, day, basket_group):
+    """Find existing slots with courses from same basket group"""
+    basket_slots = []
+    for slot_idx, slot in timetable[day].items():
+        code = slot.get('code', '')
+        if code and get_basket_group(code) == basket_group:
+            basket_slots.append(slot_idx)
+    return basket_slots
+
+def find_adjacent_lab_room(room_id, rooms):
+    """Find an adjacent lab room based on room numbering"""
+    if not room_id:
+        return None
+    
+    # Get room number and extract base info
+    current_num = int(''.join(filter(str.isdigit, rooms[room_id]['roomNumber'])))
+    current_floor = current_num // 100
+    
+    # Look for adjacent room with same type
+    for rid, room in rooms.items():
+        if rid != room_id and room['type'] == rooms[room_id]['type']:
+            room_num = int(''.join(filter(str.isdigit, room['roomNumber'])))
+            # Check if on same floor and adjacent number
+            if room_num // 100 == current_floor and abs(room_num - current_num) == 1:
+                return rid
+    return None
+
+def try_room_allocation(rooms, course_type, required_capacity, day, start_slot, duration, used_room_ids):
+    """Helper function to try allocating rooms of a certain type"""
+    for room_id, room in rooms.items():
+        if room_id in used_room_ids or room['type'].upper() == 'LIBRARY':
+            continue
+            
+        # For lectures and tutorials, only use lecture rooms and seater rooms
+        if course_type in ['LEC', 'TUT', 'SS']:
+            if not ('LECTURE_ROOM' in room['type'].upper() or 'SEATER' in room['type'].upper()):
+                continue
+        # For labs, match lab type exactly
+        elif course_type == 'COMPUTER_LAB' and room['type'].upper() != 'COMPUTER_LAB':
+            continue
+        elif course_type == 'HARDWARE_LAB' and room['type'].upper() != 'HARDWARE_LAB':
+            continue
+            
+        # Check capacity except for labs which can be split into batches
+        if course_type not in ['COMPUTER_LAB', 'HARDWARE_LAB'] and room['capacity'] < required_capacity:
+            continue
+
+        # Check availability
+        slots_free = True
+        for i in range(duration):
+            if start_slot + i in room['schedule'][day]:
+                slots_free = False
+                break
+                
+        if slots_free:
+            for i in range(duration):
+                room['schedule'][day].add(start_slot + i)
+            return room_id
+                
+    return None
+
+def get_required_room_type(course):
+    """Determine required room type based on course attributes"""
+    if pd.notna(course['P']) and course['P'] > 0:
+        course_code = str(course['Course Code']).upper()
+        # For CS courses, use computer labs
+        if 'CS' in course_code or 'DS' in course_code:
+            return 'COMPUTER_LAB'
+        # For EC courses, use hardware labs
+        elif 'EC' in course_code:
+            return 'HARDWARE_LAB'
+        return 'COMPUTER_LAB'  # Default to computer lab if unspecified
+    else:
+        # For lectures, tutorials, and self-study
+        return 'LECTURE_ROOM'
+
+def find_suitable_room(course_type, department, semester, day, start_slot, duration, rooms, batch_info, timetable, course_code="", used_rooms=None):
+    """Find suitable room(s) considering student numbers and avoiding room conflicts"""
+    if not rooms:
+        return "DEFAULT_ROOM"
+    
+    required_capacity = 60  # Default fallback
+    is_basket = is_basket_course(course_code)
+    total_students = None
+    
+    try:
+        # Get total_students from combined.csv for the course
+        df = pd.read_csv('combined.csv')
+        
+        if course_code and not is_basket:
+            # For regular courses, get total_students from the course row
+            course_row = df[df['Course Code'] == course_code]
+            if not course_row.empty and 'total_students' in course_row.columns:
+                total_students = int(course_row['total_students'].iloc[0])
+        elif is_basket:
+            # For basket courses, get total_students from the course row
+            course_row = df[df['Course Code'] == course_code]
+            if not course_row.empty and 'total_students' in course_row.columns:
+                total_students = int(course_row['total_students'].iloc[0])
+            else:
+                # Fallback to batch_info if course not found directly
+                elective_info = batch_info.get(('ELECTIVE', course_code))
+                if elective_info:
+                    total_students = elective_info['section_size']
+        else:
+            # If no course code (should not happen), fallback to dept info
+            dept_info = batch_info.get((department, semester))
+            if dept_info:
+                total_students = dept_info['section_size']
+    except Exception as e:
+        print(f"Warning: Error getting total_students from combined.csv: {e}")
+    
+    # If we have total_students, use it, otherwise fallback to batch_info
+    if total_students:
+        required_capacity = total_students
+    elif batch_info:
+        # Fallbacks using batch_info
+        if is_basket:
+            elective_info = batch_info.get(('ELECTIVE', course_code))
+            if elective_info:
+                required_capacity = elective_info['section_size']
+        else:
+            dept_info = batch_info.get((department, semester))
+            if dept_info:
+                required_capacity = dept_info['section_size']
+
+    used_room_ids = set() if used_rooms is None else used_rooms
+
+    # Special handling for large classes based on total_students
+    if course_type in ['LEC', 'TUT', 'SS'] and required_capacity > 70:
+        # For classes with more than 70 students, try to use SEATER_120 rooms first
+        seater_120_rooms = {rid: room for rid, room in rooms.items() 
+                           if 'SEATER_120' in room['type'].upper()}
+        
+        # For classes with more than 120 students, use SEATER_240 rooms
+        if required_capacity > 120:
+            seater_240_rooms = {rid: room for rid, room in rooms.items() 
+                              if 'SEATER_240' in room['type'].upper()}
+            
+            # Try allocating from SEATER_240 first
+            room_id = try_room_allocation(seater_240_rooms, 'LEC', required_capacity,
+                                        day, start_slot, duration, used_room_ids)
+            if room_id:
+                return room_id
+                
+        # Then try SEATER_120 rooms
+        room_id = try_room_allocation(seater_120_rooms, 'LEC', required_capacity,
+                                    day, start_slot, duration, used_room_ids)
+        if room_id:
+            return room_id
+
+    # Special handling for labs to get adjacent rooms if needed
+    if course_type in ['COMPUTER_LAB', 'HARDWARE_LAB']:
+        # Check if student count exceeds standard lab capacity
+        if required_capacity > 35:  # Standard lab capacity
+            # Try to find adjacent lab rooms
+            for room_id, room in rooms.items():
+                if room_id in used_room_ids or room['type'].upper() != course_type:
+                    continue
+                    
+                # Check if this room is available
+                slots_free = True
+                for i in range(duration):
+                    if start_slot + i in room['schedule'][day]:
+                        slots_free = False
+                        break
+                
+                if slots_free:
+                    # Try to find an adjacent room
+                    adjacent_room = find_adjacent_lab_room(room_id, rooms)
+                    if adjacent_room and adjacent_room not in used_room_ids:
+                        # Check if adjacent room is also available
+                        adjacent_free = True
+                        for i in range(duration):
+                            if start_slot + i in rooms[adjacent_room]['schedule'][day]:
+                                adjacent_free = False
+                                break
+                        
+                        if adjacent_free:
+                            # Mark both rooms as used
+                            for i in range(duration):
+                                room['schedule'][day].add(start_slot + i)
+                                rooms[adjacent_room]['schedule'][day].add(start_slot + i)
+                            return f"{room_id},{adjacent_room}"  # Return both room IDs
+                            
+        # If we don't need two rooms or couldn't find adjacent ones, use regular allocation
+        return try_room_allocation(rooms, course_type, required_capacity, day, start_slot, duration, used_room_ids)
+
+    # For lectures and basket courses, try different room types in priority order
+    if course_type in ['LEC', 'TUT', 'SS'] or is_basket:
+        # First try regular lecture rooms
+        lecture_rooms = {rid: room for rid, room in rooms.items() 
+                        if 'LECTURE_ROOM' in room['type'].upper()}
+        
+        # For basket courses, need special room allocation
+        if is_basket:
+            basket_group = get_basket_group(course_code)
+            basket_used_rooms = set()
+            basket_group_rooms = {}  # Track rooms already allocated to this basket group
+            
+            # Track room usage count
+            room_usage = {rid: sum(len(room['schedule'][d]) for d in range(len(DAYS))) 
+                         for rid, room in rooms.items()}
+            
+            # Sort lecture rooms by usage count
+            sorted_lecture_rooms = dict(sorted(lecture_rooms.items(), 
+                                             key=lambda x: room_usage[x[0]]))
+            
+            # Check room availability for the sorted rooms
+            for room_id, room in sorted_lecture_rooms.items():
+                is_used = False
+                for slot in range(start_slot, start_slot + duration):
+                    if slot in rooms[room_id]['schedule'][day]:
+                        # Check if room is used by any course from same basket group
+                        if slot in timetable[day]:
+                            slot_data = timetable[day][slot]
+                            if (slot_data['classroom'] == room_id and 
+                                slot_data['type'] is not None):
+                                slot_code = slot_data.get('code', '')
+                                if get_basket_group(slot_code) == basket_group:
+                                    basket_group_rooms[slot_code] = room_id
+                                else:
+                                    basket_used_rooms.add(room_id)
+                        is_used = True
+                        break
+                
+                # Room is free for this time slot
+                if not is_used and room_id not in basket_used_rooms:
+                    if 'capacity' in room and room['capacity'] >= required_capacity:
+                        # Mark slots as used
+                        for i in range(duration):
+                            room['schedule'][day].add(start_slot + i)
+                        return room_id
+            
+            # If no unused room found, try existing basket group rooms
+            if course_code in basket_group_rooms:
+                return basket_group_rooms[course_code]
+            
+            # Try remaining rooms through regular allocation
+            room_id = try_room_allocation(lecture_rooms, 'LEC', required_capacity,
+                                        day, start_slot, duration, basket_used_rooms)
+            
+            if room_id:
+                basket_group_rooms[course_code] = room_id
+            
+            return room_id
+
+        # For non-basket courses, use regular lecture rooms
+        return try_room_allocation(lecture_rooms, 'LEC', required_capacity,
+                                 day, start_slot, duration, used_room_ids)
+    
+    # For labs, use existing logic
+    return try_room_allocation(rooms, course_type, required_capacity,
+                             day, start_slot, duration, used_room_ids)
+
+def check_faculty_daily_components(professor_schedule, faculty, day, department, semester, section, timetable, course_code=None, activity_type=None):
+    """Check faculty/course scheduling constraints for the day"""
+    component_count = 0
+    faculty_courses = set()  # Track faculty's courses 
+    
+    # Check all slots for this day
+    for slot in timetable[day].values():
+        if slot['faculty'] == faculty and slot['type'] in ['LEC', 'LAB', 'TUT']:
+            slot_code = slot.get('code', '')
+            if slot_code:
+                # For non-basket courses
+                if not is_basket_course(slot_code):
+                    component_count += 1
+                # For basket courses, only count if not already counted
+                elif slot_code not in faculty_courses:
+                    component_count += 1
+                    faculty_courses.add(slot_code)
+                    
+    # Special handling for basket courses - allow parallel scheduling
+    if course_code and is_basket_course(course_code):
+        basket_group = get_basket_group(course_code)
+        existing_slots = get_basket_group_slots(timetable, day, basket_group)
+        if existing_slots:
+            # For basket courses, check only non-basket components
+            return component_count < 3  # Allow more flexibility for basket courses
+    
+    return component_count < 2  # Keep max 2 components per day limit for regular courses
+
+def check_faculty_course_gap(professor_schedule, timetable, faculty, course_code, day, start_slot):
+    """Check if there is sufficient gap (3 hours) between sessions of same course"""
+    min_gap_hours = 3
+    slots_per_hour = 2  # Assuming 30-min slots
+    required_gap = min_gap_hours * slots_per_hour
+    
+    # Check previous slots
+    for i in range(max(0, start_slot - required_gap), start_slot):
+        if i in professor_schedule[faculty][day]:
+            slot_data = timetable[day][i]
+            if slot_data['code'] == course_code and slot_data['type'] in ['LEC', 'TUT']:
+                return False
+                
+    # Check next slots  
+    for i in range(start_slot + 1, min(len(TIME_SLOTS), start_slot + required_gap)):
+        if i in professor_schedule[faculty][day]:
+            slot_data = timetable[day][i]
+            if slot_data['code'] == course_code and slot_data['type'] in ['LEC', 'TUT']:
+                return False
+    
+    return True
+
+def is_preferred_slot(faculty, day, time_slot, faculty_preferences):
+    """Check if a time slot is within faculty's preferences"""
+    if faculty not in faculty_preferences:
+        return True  # No preferences specified, any slot is fine
+        
+    prefs = faculty_preferences[faculty]
+    
+    # Check if day is preferred
+    if prefs['preferred_days'] and DAYS[day] not in prefs['preferred_days']:
+        return False
+        
+    # Check if time is within preferred ranges
+    if prefs['preferred_times']:
+        slot_start, slot_end = time_slot
+        for pref_start, pref_end in prefs['preferred_times']:
+            if (slot_start >= pref_start and slot_end <= pref_end):
+                return True
+        return False
+        
+    return True  # No time preferences specified
+
+def is_lecture_scheduled(timetable, day, start_slot, end_slot):
+    """Check if there's a lecture scheduled in the given time range"""
+    for slot in range(start_slot, end_slot):
+        if (slot < len(timetable[day]) and 
+            timetable[day][slot]['type'] and 
+            timetable[day][slot]['type'] in ['LEC', 'LAB', 'TUT']):
+            return True
+    return False
+
+def get_best_slots(timetable, professor_schedule, faculty, day, duration, semester, department):
+    """Find best available consecutive slots in a day"""
+    best_slots = []
+    
+    for start_slot in range(len(TIME_SLOTS) - duration + 1):
+        slots_free = True
+        # Check each slot in the duration
+        for i in range(duration):
+            current_slot = start_slot + i
+            # Different handling for LAB vs other activities
+            if duration == LAB_DURATION:
+                # For labs, block slots even if they have basket courses
+                # This ensures labs get priority over basket courses
+                if (current_slot in professor_schedule[faculty][day] or
+                    timetable[day][current_slot]['type'] is not None or  # Block any existing schedule
+                    is_break_time(TIME_SLOTS[current_slot], semester)):
+                    slots_free = False
+                    break
+            else:
+                # Original logic for lectures/tutorials
+                if (current_slot in professor_schedule[faculty][day] or
+                    (timetable[day][current_slot]['type'] is not None and
+                     not is_basket_course(timetable[day][current_slot].get('code', ''))) or
+                    is_break_time(TIME_SLOTS[current_slot], semester)):
+                    slots_free = False
+                    break
+
+        if slots_free:
+            # Prioritize morning slots (before lunch) for labs
+            if duration == LAB_DURATION:
+                slot_time = TIME_SLOTS[start_slot][0]
+                if slot_time < time(12, 30):  # Before lunch
+                    best_slots.insert(0, start_slot)  # Add to beginning of list (higher priority)
+                else:
+                    best_slots.append(start_slot)
+            else:
+                best_slots.append(start_slot)
+    
+    return best_slots
+
+def is_slot_reserved(slot, day, semester, department, reserved_slots):
+    """Check if a time slot is reserved for this semester and department"""
+    if day not in reserved_slots:
+        return False
+        
+    slot_start, slot_end = slot
+    
+    # Check each reservation
+    for (dept, semesters), slots in reserved_slots[day].items():
+        # Match if department is ALL or matches exactly
+        if dept == 'ALL' or dept == department:
+            # Match if semester is in the expanded semester list
+            if str(semester) in semesters or any(str(semester).startswith(s) for s in semesters):
+                for reserved_start, reserved_end in slots:
+                    if (slot_start >= reserved_start and slot_start < reserved_end) or \
+                       (slot_end > reserved_start and slot_end <= reserved_end):
+                        return True
+    return False
+
+def get_course_priority(course):
+    """Calculate course scheduling priority based on constraints"""
+    priority = 0
+    code = str(course['Course Code'])
+    
+    # Give regular course labs highest priority with much higher weight
+    if pd.notna(course['P']) and course['P'] > 0 and not is_basket_course(code):
+        priority += 10  # Increased from 5 to 10 for regular labs
+        if 'CS' in code or 'EC' in code:  # Extra priority for CS/EC labs
+            priority += 2
+    elif is_basket_course(code):
+        priority += 1  # Keep lowest priority for basket courses
+    elif pd.notna(course['L']) and course['L'] > 2:
+        priority += 3  # Regular lectures priority
+    elif pd.notna(course['T']) and course['T'] > 0:
+        priority += 2  # Tutorial priority
+    return priority
+
+def calculate_required_slots(course):
+    """Calculate how many slots needed based on L, T, P, S values and credits"""
+    l = float(course['L']) if pd.notna(course['L']) else 0  # Lecture credits
+    t = int(course['T']) if pd.notna(course['T']) else 0    # Tutorial hours
+    p = int(course['P']) if pd.notna(course['P']) else 0    # Lab hours
+    s = int(course['S']) if pd.notna(course['S']) else 0    # Self study hours
+    c = int(course['C']) if pd.notna(course['C']) else 0    # Total credits
+    
+    # Check if course is self-study only
+    if s > 0 and l == 0 and t == 0 and p == 0:
+        return 0, 0, 0, 0
+        
+    # Calculate number of lecture sessions based on credits
+    lecture_sessions = 0
+    if l > 0:
+        # For 3 credits = 2 sessions of 1.5 hours each
+        # For 2 credits = 1 session of 1.5 hours plus a 1 hour session
+        # For 1 credit = 1 session of 1.5 hours
+        lecture_sessions = max(1, round(l * 2/3))  # Scale credits to sessions
+    
+    # Other calculations remain the same
+    tutorial_sessions = t  
+    lab_sessions = p // 2  # 2 hours per lab session
+    self_study_sessions = s // 4 if (l > 0 or t > 0 or p > 0) else 0
+    
+    return lecture_sessions, tutorial_sessions, lab_sessions, self_study_sessions
+
+def select_faculty(faculty_str):
+    """Select a faculty from potentially multiple options."""
+    if '/' in faculty_str:
+        # Split by slash and strip whitespace
+        faculty_options = [f.strip() for f in faculty_str.split('/')]
+        return faculty_options[0]  # Take first faculty as default
+    return faculty_str
+
+class UnscheduledComponent:
+    def __init__(self, department, semester, code, name, faculty, component_type, sessions, section='', reason=''):
+        self.department = department
+        self.semester = semester
+        self.code = code
+        self.name = name
+        self.faculty = faculty 
+        self.component_type = component_type
+        self.sessions = sessions
+        self.section = section
+        self.reason = reason
+        
+    def __eq__(self, other):
+        if not isinstance(other, UnscheduledComponent):
+            return False
+        return (self.department == other.department and
+                self.semester == other.semester and
+                self.code == other.code and
+                self.component_type == other.component_type and
+                self.section == other.section)
+    
+    def __hash__(self):
+        return hash((self.department, self.semester, self.code, self.component_type, self.section))
 
 if __name__ == "__main__":
     generate_all_timetables()
