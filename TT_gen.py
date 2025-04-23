@@ -438,10 +438,14 @@ def generate_all_timetables():
                                     scheduled = True
                             attempts += 1
                         if not scheduled:
-                            unscheduled_components.add(
-                                UnscheduledComponent(department, semester, code, name, 
-                                                   faculty, 'LEC', 1, section)
-                            )
+                                # Generate detailed reason for why this component couldn't be scheduled
+                                detailed_reason = unscheduled_reason(course, department, semester, 
+                                                                  professor_schedule, rooms, 'LEC', attempts)
+                                
+                                unscheduled_components.add(
+                                    UnscheduledComponent(department, semester, code, name, 
+                                                       faculty, 'LEC', 1, section, detailed_reason)
+                                )
 
                     # Schedule tutorials
                     for _ in range(tutorial_sessions):
@@ -492,9 +496,13 @@ def generate_all_timetables():
                                     scheduled = True
                             attempts += 1
                         if not scheduled:
+                            # Generate detailed reason for why this tutorial couldn't be scheduled
+                            detailed_reason = unscheduled_reason(course, department, semester, 
+                                                              professor_schedule, rooms, 'TUT', attempts)
+                            
                             unscheduled_components.add(
                                 UnscheduledComponent(department, semester, code, name,
-                                                   faculty, 'TUT', 1, section)
+                                                   faculty, 'TUT', 1, section, detailed_reason)
                             )
 
                     # Schedule labs with tracking
@@ -538,10 +546,13 @@ def generate_all_timetables():
                                     break
                                 
                             if not scheduled:
+                                # Generate detailed reason for why this lab component couldn't be scheduled
+                                detailed_reason = unscheduled_reason(course, department, semester, 
+                                                                  professor_schedule, rooms, 'LAB', attempts)
+                                
                                 unscheduled_components.add(
                                     UnscheduledComponent(department, semester, code, name,
-                                                       faculty, 'LAB', 1, section,
-                                                       "Could not find suitable room and time slot combination")
+                                                       faculty, 'LAB', 1, section, detailed_reason)
                                 )
 
                 # Schedule self-study sessions
@@ -1157,13 +1168,22 @@ def check_unscheduled_courses():
         traceback.print_exc()
 
 def generate_faculty_timetables():
-    """Generate individual timetables for each faculty member"""
+    """Generate timetables for all faculty members in a single Excel file"""
     try:
         # Load the generated timetable
         wb = pd.ExcelFile('timetable_all_departments.xlsx')
         
         # Dictionary to track faculty schedules
         faculty_schedules = {}
+        
+        print("Processing timetable sheets to extract faculty schedules...")
+        
+        # Load courses data for reference
+        try:
+            courses_data = pd.read_csv('combined.csv')
+        except Exception as e:
+            print(f"Warning: Could not load combined.csv for reference: {e}")
+            courses_data = None
         
         # Process each sheet in the timetable workbook
         for sheet_name in wb.sheet_names:
@@ -1173,6 +1193,8 @@ def generate_faculty_timetables():
             if 'Day' not in timetable_df.columns:
                 continue
                 
+            print(f"Processing sheet: {sheet_name}")
+            
             # Extract department and semester from sheet name
             dept_sem = sheet_name
                 
@@ -1189,179 +1211,481 @@ def generate_faculty_timetables():
                     # Skip empty cells or break cells
                     if pd.isna(cell_value) or cell_value == '' or cell_value == 'BREAK':
                         continue
-                        
-                    # Extract course code, class type, and faculty
-                    # Format example: "CS101 LEC room no. :A101"
-                    if isinstance(cell_value, str) and 'room no.' in cell_value:
-                        # Split the cell value to extract components
-                        parts = cell_value.split()
-                        if len(parts) >= 2:
-                            # Find faculty information from combined.csv
-                            course_code = parts[0]
-                            class_type = parts[1]
+                    
+                    # Debug print for cell content inspection
+                    # print(f"Cell content: {cell_value}")
+                    
+                    # First pattern: "COURSE_CODE CLASS_TYPE\nroom no. :ROOM\nFACULTY_NAME"
+                    if isinstance(cell_value, str) and "room no." in cell_value:
+                        try:
+                            lines = cell_value.strip().split('\n')
                             
-                            try:
-                                # Get the original course data to extract faculty info
-                                course_data = pd.read_csv('combined.csv')
-                                course_row = course_data[course_data['Course Code'] == course_code]
+                            # First line contains course code and class type
+                            first_line_parts = lines[0].split()
+                            if len(first_line_parts) >= 2:
+                                course_code = first_line_parts[0]
+                                class_type = first_line_parts[1]
                                 
-                                if not course_row.empty:
-                                    faculty = str(course_row['Faculty'].iloc[0])
-                                    room_info = cell_value.split('room no. :')[1].strip() if 'room no. :' in cell_value else "Unknown"
-                                    course_name = str(course_row['Course Name'].iloc[0])
+                                # Room information is in the second line
+                                room_info = lines[1].replace('room no. :', '').strip() if len(lines) > 1 else "Unknown"
+                                
+                                # Faculty is in the third line
+                                faculty_name = lines[2].strip() if len(lines) > 2 else ""
+                                
+                                # If faculty name is empty or too short, try to get it from courses_data
+                                if not faculty_name or len(faculty_name) < 2:
+                                    if courses_data is not None:
+                                        course_row = courses_data[courses_data['Course Code'] == course_code]
+                                        if not course_row.empty:
+                                            faculty_name = str(course_row['Faculty'].iloc[0])
+                                
+                                # Get course name from courses_data
+                                course_name = ""
+                                if courses_data is not None:
+                                    course_row = courses_data[courses_data['Course Code'] == course_code]
+                                    if not course_row.empty:
+                                        course_name = str(course_row['Course Name'].iloc[0])
+                                
+                                # Process each faculty
+                                if faculty_name:
+                                    faculty_list = extract_faculty_names(faculty_name)
                                     
-                                    # Initialize faculty entry if not already exists
-                                    if faculty not in faculty_schedules:
-                                        faculty_schedules[faculty] = {d: {} for d in DAYS}
-                                    
-                                    # Add this class to faculty schedule
-                                    time_slot_str = col
-                                    faculty_schedules[faculty][day][time_slot_str] = {
-                                        'Course Code': course_code,
-                                        'Course Name': course_name,
-                                        'Class Type': class_type,
-                                        'Room': room_info,
-                                        'Department-Semester': dept_sem
-                                    }
-                            except Exception as e:
-                                print(f"Error finding faculty for {course_code}: {e}")
+                                    for faculty in faculty_list:
+                                        if faculty.strip():  # Only process non-empty faculty names
+                                            # Initialize faculty entry if not already exists
+                                            if faculty not in faculty_schedules:
+                                                faculty_schedules[faculty] = {d: {} for d in DAYS}
+                                            
+                                            # Add this class to faculty schedule
+                                            time_slot_str = col
+                                            faculty_schedules[faculty][day][time_slot_str] = {
+                                                'Course Code': course_code,
+                                                'Course Name': course_name,
+                                                'Class Type': class_type,
+                                                'Room': room_info,
+                                                'Department-Semester': dept_sem
+                                            }
+                        except Exception as e:
+                            print(f"Error processing cell: {cell_value}")
+                            print(f"Error details: {e}")
+                            traceback.print_exc()
+                    
+                    # Second pattern: Handle basket course format
+                    elif isinstance(cell_value, str) and "Courses" in cell_value:
+                        try:
+                            lines = cell_value.strip().split('\n')
+                            
+                            # Skip the header line
+                            basket_courses = []
+                            basket_details = []
+                            
+                            # Process each line to extract course details
+                            for line in lines[1:]:
+                                if ':' in line:  # This is a detail line with faculty and room
+                                    parts = line.split(':')
+                                    if len(parts) >= 2:
+                                        code = parts[0].strip()
+                                        details = parts[1].strip()
+                                        
+                                        # Extract faculty and room
+                                        if '(' in details and ')' in details:
+                                            faculty_part = details.split('(')[0].strip()
+                                            room_part = details.split('(')[1].split(')')[0].strip()
+                                            
+                                            basket_details.append({
+                                                'code': code,
+                                                'faculty': faculty_part,
+                                                'room': room_part
+                                            })
+                                elif ',' in line and not any(x in line for x in ['Courses', 'room no.']):
+                                    # This might be the course codes line
+                                    basket_courses = [code.strip() for code in line.split(',')]
+                            
+                            # Process each basket course
+                            for detail in basket_details:
+                                code = detail['code']
+                                faculty_name = detail['faculty']
+                                room_info = detail['room']
+                                
+                                # Get course name from courses_data
+                                course_name = ""
+                                if courses_data is not None:
+                                    course_row = courses_data[courses_data['Course Code'] == code]
+                                    if not course_row.empty:
+                                        course_name = str(course_row['Course Name'].iloc[0])
+                                
+                                # Determine class type from the original cell
+                                class_type = "LEC"  # Default
+                                if "LAB" in cell_value:
+                                    class_type = "LAB"
+                                elif "TUT" in cell_value:
+                                    class_type = "TUT"
+                                
+                                # Process faculty names
+                                faculty_list = extract_faculty_names(faculty_name)
+                                
+                                for faculty in faculty_list:
+                                    if faculty.strip():  # Only process non-empty faculty names
+                                        # Initialize faculty entry if not already exists
+                                        if faculty not in faculty_schedules:
+                                            faculty_schedules[faculty] = {d: {} for d in DAYS}
+                                        
+                                        # Add this class to faculty schedule
+                                        time_slot_str = col
+                                        faculty_schedules[faculty][day][time_slot_str] = {
+                                            'Course Code': code,
+                                            'Course Name': course_name,
+                                            'Class Type': class_type,
+                                            'Room': room_info,
+                                            'Department-Semester': dept_sem
+                                        }
+                        except Exception as e:
+                            print(f"Error processing basket cell: {cell_value}")
+                            print(f"Error details: {e}")
         
-        # Create a new workbook for faculty timetables
+        # Create a single Excel workbook for all faculty timetables
+        print(f"Creating a consolidated Excel file with {len(faculty_schedules)} faculty timetables...")
         faculty_wb = Workbook()
-        faculty_wb.remove(faculty_wb.active)  # Remove default sheet
         
-        # Sort faculty names for alphabetical order
-        sorted_faculty_names = sorted(faculty_schedules.keys())
+        # Remove the default sheet
+        if "Sheet" in faculty_wb.sheetnames:
+            faculty_wb.remove(faculty_wb["Sheet"])
         
-        # Define a function to sanitize sheet names (remove invalid Excel sheet name characters)
-        def sanitize_sheet_name(name):
-            # Replace characters that are not allowed in Excel sheet names
-            invalid_chars = ['/', '\\', '?', '*', ':', '[', ']', "'"]
-            sanitized_name = name
-            for char in invalid_chars:
-                sanitized_name = sanitized_name.replace(char, '_')
-            
-            # Excel sheet names are limited to 31 characters
-            if len(sanitized_name) > 31:
-                sanitized_name = sanitized_name[:31]
-                
-            return sanitized_name
+        # Create an overview/index sheet
+        overview = faculty_wb.create_sheet("Overview", 0)
+        overview.column_dimensions['A'].width = 40
+        overview.column_dimensions['B'].width = 15
         
-        # Keep a mapping of sanitized names to original names to handle duplicates
-        sanitized_to_original = {}
+        # Add title and headers
+        overview.append(["Faculty Timetable - All Faculty"])
+        overview.append(["Generated on:", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        overview.append([])
+        overview.append(["Faculty Name", "Total Classes"])
         
-        for faculty in sorted_faculty_names:
-            # Create a sanitized sheet name
-            sanitized_faculty = sanitize_sheet_name(faculty)
+        # Apply formatting to headers
+        for row in range(1, 5):
+            for cell in overview[row]:
+                cell.font = Font(bold=True)
+        
+        # Style the header row
+        for cell in overview[4]:
+            cell.fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                top=Side(style='thin'), bottom=Side(style='thin'))
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add faculty list to overview with hyperlinks to their sheets
+        row_idx = 5
+        for faculty in sorted(faculty_schedules.keys()):
+            total_classes = len(sum([list(slots.keys()) for slots in faculty_schedules[faculty].values()], []))
             
-            # Handle duplicate sanitized names by adding a number
-            if sanitized_faculty in sanitized_to_original:
-                base_name = sanitized_faculty
-                counter = 1
-                # Try adding numbers until we find a unique name
-                while sanitized_faculty in sanitized_to_original:
-                    sanitized_faculty = f"{base_name[:27]}_{counter}"  # Leave room for the counter
-                    counter += 1
+            # Add to overview sheet
+            overview.cell(row=row_idx, column=1, value=faculty)
+            overview.cell(row=row_idx, column=2, value=total_classes)
             
-            # Store the mapping
-            sanitized_to_original[sanitized_faculty] = faculty
+            # Add hyperlink to the faculty's sheet
+            safe_name = sanitize_sheet_name(faculty)
+            overview.cell(row=row_idx, column=1).hyperlink = f"#{safe_name}!A1"
+            overview.cell(row=row_idx, column=1).style = "Hyperlink"
             
-            # Create a worksheet for this faculty using the sanitized name
-            ws = faculty_wb.create_sheet(title=sanitized_faculty)
+            # Add border to cells
+            for col in range(1, 3):
+                overview.cell(row=row_idx, column=col).border = Border(
+                    left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin')
+                )
             
-            # Add the original faculty name as the first row title
-            ws.merge_cells('A1:G1')
-            title_cell = ws['A1']
-            title_cell.value = f"Schedule for: {faculty}"
-            title_cell.font = Font(bold=True, size=14)
-            title_cell.alignment = Alignment(horizontal='center', vertical='center')
-            title_cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+            row_idx += 1
+        
+        # Generate worksheets for each faculty
+        for i, faculty in enumerate(sorted(faculty_schedules.keys())):
+            # Create a sanitized sheet name (Excel has a 31 character limit for sheet names)
+            sheet_name = sanitize_sheet_name(faculty)
             
-            # Create header (starting from row 2 now)
-            header = ['Day', 'Time Slot', 'Course Code', 'Course Name', 'Class Type', 'Room', 'Department-Semester']
-            ws.append(header)
+            # Create a new worksheet for this faculty
+            ws = faculty_wb.create_sheet(title=sheet_name)
             
-            # Apply header formatting
-            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
-            header_font = Font(bold=True, color="FFFFFF")
-            header_alignment = Alignment(horizontal='center', vertical='center')
+            # Generate the faculty's timetable in this worksheet
+            create_faculty_worksheet(ws, faculty, faculty_schedules[faculty])
             
-            for cell in ws[2]:  # Now header is in row 2
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = header_alignment
-            
-            # Add each scheduled class for this faculty
-            row_idx = 3  # Start data from row 3
-            for day in DAYS:
-                # Sort time slots chronologically
-                time_slots = sorted(faculty_schedules[faculty][day].keys())
-                
-                if not time_slots:  # No classes on this day
-                    ws.append([day, "No classes scheduled", "", "", "", "", ""])
-                    row_idx += 1
-                    continue
-                    
-                for time_slot in time_slots:
-                    class_info = faculty_schedules[faculty][day][time_slot]
-                    
-                    # Add this class to the worksheet
-                    ws.append([
-                        day,
-                        time_slot,
-                        class_info['Course Code'],
-                        class_info['Course Name'],
-                        class_info['Class Type'],
-                        class_info['Room'],
-                        class_info['Department-Semester']
-                    ])
-                    
-                    # Apply formatting
-                    for cell in ws[row_idx]:
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                           top=Side(style='thin'), bottom=Side(style='thin'))
-                    
-                    # Highlight each class type differently
-                    class_type = class_info['Class Type']
-                    if class_type == 'LEC':
-                        fill_color = "B8CCE4"  # Light blue
-                    elif class_type == 'TUT':
-                        fill_color = "E4B8CC"  # Pink
-                    elif class_type == 'LAB':
-                        fill_color = "CCE4B8"  # Light green
-                    else:
-                        fill_color = "F2F2F2"  # Light gray
-                        
-                    # Apply fill color
-                    for cell in ws[row_idx]:
-                        cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-                    
-                    row_idx += 1
-            
-            # Set predefined column widths instead of auto-adjusting to avoid MergedCell error
-            column_widths = {
-                'A': 15,  # Day
-                'B': 20,  # Time Slot
-                'C': 15,  # Course Code
-                'D': 40,  # Course Name
-                'E': 12,  # Class Type
-                'F': 25,  # Room
-                'G': 30,  # Department-Semester
-            }
-            
-            # Apply the predefined widths
-            for col_letter, width in column_widths.items():
-                ws.column_dimensions[col_letter].width = width
+            if i % 10 == 0:  # Print progress every 10 faculty
+                print(f"Generated {i+1}/{len(faculty_schedules)} faculty worksheets")
         
         # Save the workbook
-        faculty_wb.save("faculties_timetable.xlsx")
-        print("Faculty timetables generated and saved to faculties_timetable.xlsx")
+        faculty_wb.save("all_faculty_timetables.xlsx")
+        print(f"All {len(faculty_schedules)} faculty timetables saved in 'all_faculty_timetables.xlsx'")
         
     except Exception as e:
         print(f"Error generating faculty timetables: {e}")
-        # Print more detailed error information for debugging
         traceback.print_exc()
+
+def sanitize_sheet_name(name):
+    """Create a valid Excel sheet name from a faculty name"""
+    # Replace invalid sheet name characters
+    invalid_chars = ['/', '\\', '?', '*', ':', '[', ']', "'", '"']
+    sanitized = name
+    for char in invalid_chars:
+        sanitized = sanitized.replace(char, '_')
+    
+    # Excel has 31 character limit for sheet names
+    if len(sanitized) > 31:
+        sanitized = sanitized[:28] + "..."
+    
+    return sanitized
+
+def create_faculty_worksheet(ws, faculty, schedule):
+    """Create a worksheet for a faculty member's timetable"""
+    # Add faculty name as title
+    ws.merge_cells('A1:G1')
+    title_cell = ws['A1']
+    title_cell.value = f"Schedule for: {faculty}"
+    title_cell.font = Font(bold=True, size=14)
+    title_cell.alignment = Alignment(horizontal='center', vertical='center')
+    title_cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    
+    # Create header (starting from row 2)
+    header = ['Day', 'Time Slot', 'Course Code', 'Course Name', 'Class Type', 'Room', 'Department-Semester']
+    ws.append(header)
+    
+    # Apply header formatting
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal='center', vertical='center')
+    
+    for cell in ws[2]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+    
+    # Add each scheduled class for this faculty
+    row_idx = 3
+    for day in DAYS:
+        # Sort time slots chronologically
+        time_slots = sorted(schedule[day].keys())
+        
+        if not time_slots:  # No classes on this day
+            ws.append([day, "No classes scheduled", "", "", "", "", ""])
+            row_idx += 1
+            continue
+            
+        for time_slot in time_slots:
+            class_info = schedule[day][time_slot]
+            
+            # Add this class to the worksheet
+            ws.append([
+                day,
+                time_slot,
+                class_info['Course Code'],
+                class_info['Course Name'],
+                class_info['Class Type'],
+                class_info['Room'],
+                class_info['Department-Semester']
+            ])
+            
+            # Apply formatting
+            for cell in ws[row_idx]:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                   top=Side(style='thin'), bottom=Side(style='thin'))
+            
+            # Highlight each class type differently
+            class_type = class_info['Class Type']
+            if class_type == 'LEC':
+                fill_color = "B8CCE4"  # Light blue
+            elif class_type == 'TUT':
+                fill_color = "E4B8CC"  # Pink
+            elif class_type == 'LAB':
+                fill_color = "CCE4B8"  # Light green
+            else:
+                fill_color = "F2F2F2"  # Light gray
+                
+            # Apply fill color
+            for cell in ws[row_idx]:
+                cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+            
+            row_idx += 1
+    
+    # Set column widths
+    column_widths = {
+        'A': 15,  # Day
+        'B': 20,  # Time Slot
+        'C': 15,  # Course Code
+        'D': 40,  # Course Name
+        'E': 12,  # Class Type
+        'F': 25,  # Room
+        'G': 30,  # Department-Semester
+    }
+    
+    # Apply the predefined widths
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+# Enhance extract_faculty_names function to handle more patterns
+def extract_faculty_names(faculty_string):
+    """Extract individual faculty names from a combined string"""
+    if not faculty_string or pd.isna(faculty_string):
+        return []
+        
+    faculty_string = str(faculty_string).strip()
+    if faculty_string.lower() in ['nan', 'none', '']:
+        return []
+        
+    faculty_names = []
+    
+    # Split by common separators and handle various formats
+    if '&' in faculty_string:
+        parts = faculty_string.split('&')
+        for part in parts:
+            faculty_names.append(part.strip())
+    elif ' and ' in faculty_string.lower():
+        # Split by "and" but be careful with words that might contain "and"
+        parts = faculty_string.lower().split(' and ')
+        for i, part in enumerate(parts):
+            # Reconstruct the original case
+            start_idx = faculty_string.lower().find(part)
+            if start_idx >= 0:
+                end_idx = start_idx + len(part)
+                faculty_names.append(faculty_string[start_idx:end_idx].strip())
+    elif ',' in faculty_string and faculty_string.count(',') > 1:
+        # Multiple commas likely indicate a list of names
+        parts = faculty_string.split(',')
+        for part in parts:
+            if part.strip():  # Skip empty parts
+                faculty_names.append(part.strip())
+    elif '/' in faculty_string:
+        parts = faculty_string.split('/')
+        for part in parts:
+            faculty_names.append(part.strip())
+    elif ';' in faculty_string:
+        parts = faculty_string.split(';')
+        for part in parts:
+            faculty_names.append(part.strip())
+    else:
+        faculty_names.append(faculty_string)  # Single faculty
+    
+    # Remove any empty strings and normalize
+    return [name.strip() for name in faculty_names if name.strip()]
+
+def generate_individual_faculty_timetable(faculty, schedule):
+    """Generate a timetable for a single faculty member"""
+    # Sanitize faculty name for file name
+    filename = sanitize_filename(faculty)
+    file_path = os.path.join('faculty_timetables', f"timetable_{filename}.xlsx")
+    
+    # Create a new workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Schedule"
+    
+    # Add faculty name as title
+    ws.merge_cells('A1:G1')
+    title_cell = ws['A1']
+    title_cell.value = f"Schedule for: {faculty}"
+    title_cell.font = Font(bold=True, size=14)
+    title_cell.alignment = Alignment(horizontal='center', vertical='center')
+    title_cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    
+    # Create header (starting from row 2)
+    header = ['Day', 'Time Slot', 'Course Code', 'Course Name', 'Class Type', 'Room', 'Department-Semester']
+    ws.append(header)
+    
+    # Apply header formatting
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal='center', vertical='center')
+    
+    for cell in ws[2]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+    
+    # Add each scheduled class for this faculty
+    row_idx = 3
+    for day in DAYS:
+        # Sort time slots chronologically
+        time_slots = sorted(schedule[day].keys())
+        
+        if not time_slots:  # No classes on this day
+            ws.append([day, "No classes scheduled", "", "", "", "", ""])
+            row_idx += 1
+            continue
+            
+        for time_slot in time_slots:
+            class_info = schedule[day][time_slot]
+            
+            # Add this class to the worksheet
+            ws.append([
+                day,
+                time_slot,
+                class_info['Course Code'],
+                class_info['Course Name'],
+                class_info['Class Type'],
+                class_info['Room'],
+                class_info['Department-Semester']
+            ])
+            
+            # Apply formatting
+            for cell in ws[row_idx]:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                   top=Side(style='thin'), bottom=Side(style='thin'))
+            
+            # Highlight each class type differently
+            class_type = class_info['Class Type']
+            if class_type == 'LEC':
+                fill_color = "B8CCE4"  # Light blue
+            elif class_type == 'TUT':
+                fill_color = "E4B8CC"  # Pink
+            elif class_type == 'LAB':
+                fill_color = "CCE4B8"  # Light green
+            else:
+                fill_color = "F2F2F2"  # Light gray
+                
+            # Apply fill color
+            for cell in ws[row_idx]:
+                cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+            
+            row_idx += 1
+    
+    # Set column widths
+    column_widths = {
+        'A': 15,  # Day
+        'B': 20,  # Time Slot
+        'C': 15,  # Course Code
+        'D': 40,  # Course Name
+        'E': 12,  # Class Type
+        'F': 25,  # Room
+        'G': 30,  # Department-Semester
+    }
+    
+    # Apply the predefined widths
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+    
+    # Save the workbook
+    wb.save(file_path)
+
+def sanitize_filename(name):
+    """Create a valid file name from a faculty name"""
+    # Replace invalid filename characters
+    invalid_chars = ['/', '\\', '?', '*', ':', '[', ']', "'", '"', '<', '>', '|', ' ']
+    sanitized = name
+    for char in invalid_chars:
+        sanitized = sanitized.replace(char, '_')
+    
+    # Remove consecutive underscores
+    while '__' in sanitized:
+        sanitized = sanitized.replace('__', '_')
+    
+    # Limit length to avoid overly long filenames
+    if len(sanitized) > 50:
+        sanitized = sanitized[:50]
+        
+    # Remove trailing underscores
+    sanitized = sanitized.rstrip('_')
+    
+    return sanitized
 
 # Initialize global variables
 TIME_SLOTS = []
@@ -2019,6 +2343,73 @@ class UnscheduledComponent:
     
     def __hash__(self):
         return hash((self.department, self.semester, self.code, self.component_type, self.section))
+
+def unscheduled_reason(course, department, semester, professor_schedule, rooms, component_type, check_attempts):
+    """Generate detailed reason why a course component couldn't be scheduled"""
+    faculty = course['Faculty']
+    code = str(course['Course Code'])
+    
+    # Check faculty availability
+    faculty_slots_used = 0
+    for day in range(len(DAYS)):
+        if faculty in professor_schedule and day in professor_schedule[faculty]:
+            faculty_slots_used += len(professor_schedule[faculty][day])
+    
+    # If faculty is heavily scheduled
+    if faculty_slots_used > 20:  # Threshold: 10 hours of teaching per week
+        return f"Faculty '{faculty}' already has {faculty_slots_used/2:.1f} hours of teaching scheduled"
+    
+    # Check room availability issues
+    if component_type == 'LAB':
+        lab_rooms_available = False
+        for _, room in rooms.items():
+            if 'LAB' in room['type'].upper() or 'COMPUTER' in room['type'].upper():
+                lab_rooms_available = True
+                break
+        
+        if not lab_rooms_available:
+            return "No suitable lab rooms available in the system"
+        
+        # Check if room is overbooked
+        lab_rooms_free_slots = 0
+        for rid, room in rooms.items():
+            if 'LAB' in room['type'].upper() or 'COMPUTER' in room['type'].upper():
+                total_slots = len(DAYS) * (len(TIME_SLOTS) - LAB_DURATION)
+                used_slots = sum(len(room['schedule'].get(day, [])) for day in range(len(DAYS)))
+                lab_rooms_free_slots += (total_slots - used_slots)
+        
+        if lab_rooms_free_slots < 5:  # Very few lab slots left
+            return f"Lab rooms almost fully booked ({lab_rooms_free_slots} slots left)"
+    
+    # Check for large classes with insufficient large rooms
+    if 'total_students' in course and pd.notna(course['total_students']):
+        try:
+            total_students = int(course['total_students'])
+            if total_students > 100:
+                large_rooms_available = False
+                for _, room in rooms.items():
+                    if room['type'].upper() == 'SEATER_120' or room['type'].upper() == 'SEATER_240':
+                        large_rooms_available = True
+                        break
+                
+                if not large_rooms_available:
+                    return f"No rooms available with capacity for {total_students} students"
+        except (ValueError, TypeError):
+            pass
+    
+    # Check timeslot conflicts with other courses in same department/semester
+    if check_attempts > 800:  # If we made many attempts but still couldn't find a slot
+        return f"No suitable timeslot found after {check_attempts} attempts - heavy scheduling conflicts"
+        
+    # Default reason
+    duration_map = {
+        'LEC': f"{LECTURE_DURATION/2} hour",
+        'LAB': f"{LAB_DURATION/2} hour",
+        'TUT': f"{TUTORIAL_DURATION/2} hour"
+    }
+    duration_str = duration_map.get(component_type, "")
+    
+    return f"Could not find compatible {duration_str} timeslot for {code} {component_type} with faculty {faculty}"
 
 if __name__ == "__main__":
     generate_all_timetables()

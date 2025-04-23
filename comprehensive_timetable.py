@@ -811,6 +811,73 @@ class UnscheduledComponent:
     def __hash__(self):
         return hash((self.department, self.semester, self.code, self.component_type, self.section))
 
+def unscheduled_reason(course, department, semester, professor_schedule, rooms, component_type, check_attempts):
+    """Generate detailed reason why a course component couldn't be scheduled"""
+    faculty = course['Faculty']
+    code = str(course['Course Code'])
+    
+    # Check faculty availability
+    faculty_slots_used = 0
+    for day in range(len(DAYS)):
+        if faculty in professor_schedule and day in professor_schedule[faculty]:
+            faculty_slots_used += len(professor_schedule[faculty][day])
+    
+    # If faculty is heavily scheduled
+    if faculty_slots_used > 20:  # Threshold: 10 hours of teaching per week
+        return f"Faculty '{faculty}' already has {faculty_slots_used/2:.1f} hours of teaching scheduled"
+    
+    # Check room availability issues
+    if component_type == 'LAB':
+        lab_rooms_available = False
+        for _, room in rooms.items():
+            if 'LAB' in room['type'].upper() or 'COMPUTER' in room['type'].upper():
+                lab_rooms_available = True
+                break
+        
+        if not lab_rooms_available:
+            return "No suitable lab rooms available in the system"
+        
+        # Check if room is overbooked
+        lab_rooms_free_slots = 0
+        for rid, room in rooms.items():
+            if 'LAB' in room['type'].upper() or 'COMPUTER' in room['type'].upper():
+                total_slots = len(DAYS) * (len(TIME_SLOTS) - LAB_DURATION)
+                used_slots = sum(len(room['schedule'].get(day, [])) for day in range(len(DAYS)))
+                lab_rooms_free_slots += (total_slots - used_slots)
+        
+        if lab_rooms_free_slots < 5:  # Very few lab slots left
+            return f"Lab rooms almost fully booked ({lab_rooms_free_slots} slots left)"
+    
+    # Check for large classes with insufficient large rooms
+    if 'total_students' in course and pd.notna(course['total_students']):
+        try:
+            total_students = int(course['total_students'])
+            if total_students > 100:
+                large_rooms_available = False
+                for _, room in rooms.items():
+                    if room['type'].upper() == 'SEATER_120' or room['type'].upper() == 'SEATER_240':
+                        large_rooms_available = True
+                        break
+                
+                if not large_rooms_available:
+                    return f"No rooms available with capacity for {total_students} students"
+        except (ValueError, TypeError):
+            pass
+    
+    # Check timeslot conflicts with other courses in same department/semester
+    if check_attempts > 800:  # If we made many attempts but still couldn't find a slot
+        return f"No suitable timeslot found after {check_attempts} attempts - heavy scheduling conflicts"
+        
+    # Default reason
+    duration_map = {
+        'LEC': f"{LECTURE_DURATION/2} hour",
+        'LAB': f"{LAB_DURATION/2} hour",
+        'TUT': f"{TUTORIAL_DURATION/2} hour"
+    }
+    duration_str = duration_map.get(component_type, "")
+    
+    return f"Could not find compatible {duration_str} timeslot for {code} {component_type} with faculty {faculty}"
+
 def generate_all_timetables():
     global lunch_breaks
     initialize_time_slots()  # Initialize time slots before using
